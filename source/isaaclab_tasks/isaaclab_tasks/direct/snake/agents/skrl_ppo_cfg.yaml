@@ -1,0 +1,56 @@
+seed: 42
+
+# Environment
+environment:
+  num_envs: 64
+  num_observations: 27
+  num_actions: 9
+  clip_actions: True
+
+# Algorithm
+algorithm:
+  name: ppo
+  entropy_coef: 0.0
+  learning_rate: 0.0003
+  learning_rate_scheduler: linear
+  learning_rate_scheduler_kwargs:
+    total_timesteps: "${algorithm.timesteps}"
+    update_step: 1
+  batch_size: 64
+  clip_range: 0.2
+  clip_range_scheduler: None
+  entropy_coef_scheduler: None
+  gamma: 0.99
+  lam: 0.95
+  normalize_advantages: True
+  normalize_rewards: False
+  timesteps: 5000000
+  value_coef: 1.0
+  value_clip_range: 0.2
+  max_grad_norm: 1.0
+
+# Models
+models:
+  policy:
+    name: gaussian_learning_std
+    architecture: mlp
+    means_std: 0.0
+    stds_init: 0.5
+    learn_std: True
+    log_std_min: -10.0
+    log_std_max: 2.0
+    min_action: -1.0
+    max_action: 1.0
+    hidden_dim: 256
+    hidden_layers: 3
+    activation: tanh
+    activation_last_layer: None
+    kernel_initializer_last_layer: "None"
+  value:
+    name: value
+    architecture: mlp
+    hidden_dim: 256
+    hidden_layers: 3
+    activation: tanh
+    activation_last_layer: None
+    kernel_initializer_last_layer: "None"
