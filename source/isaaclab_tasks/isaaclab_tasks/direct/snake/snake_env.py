@@ -29,10 +29,10 @@ from isaaclab.terrains import TerrainImporter
 class SnakeEnvCfg(DirectRLEnvCfg):
     # env
     decimation = 2
-    episode_length_s = 100.0
-    action_scale = 1.0  # rad/s - velocity control scale  #TODO: tune this
-    action_space = 9    # 9 joints
-    observation_space = 28
+    episode_length_s = 10.0
+    action_scale = 1.0  # rad #TODO: tune this
+    action_space = 1    # 9 joints
+    observation_space = 12 #TODO: fix this
     state_space = 0
     link_length = 4.0  #TODO: Get this from the USD instead of hardcoding # Length of each link in meters, used for height termination
 
@@ -40,13 +40,13 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation)
 
     # scene
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=40.0, replicate_physics=True)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=64, env_spacing=8.0, replicate_physics=True)
 
     # -- Robot Configuration (Loading from USD)
     robot: ArticulationCfg = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot", # Standard prim path pattern
         spawn=sim_utils.UsdFileCfg(
-            usd_path="/home/hzade/temp/snake_velocity.usd",
+            usd_path="/home/hzade/temp/snake_2_link.usd",
             activate_contact_sensors=False, # Set to True if you need contact sensors #TODO: check this
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=False,
@@ -61,15 +61,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
         init_state=ArticulationCfg.InitialStateCfg(
             # Define initial joint positions
             joint_pos={
-                 "joint_1": 0.0,
-                 "joint_2": 0.0,
-                 "joint_3": 0.0,
-                 "joint_4": 0.0,
-                 "joint_5": 0.0,
-                 "joint_6": 0.0,
-                 "joint_7": 0.0,
-                 "joint_8": 0.0,
-                 "joint_9": 0.0,
+                "joint_1": 0.0,
             },
             pos=(0.0, 0.0, 1.0),  # Initial base position (adjust height based on robot)
             rot=(0.0, 0.0, 0.0, 1.0), # Initial base orientation
@@ -78,11 +70,11 @@ class SnakeEnvCfg(DirectRLEnvCfg):
             # Define actuators for your joints #TODO: tune all these parameters
             "snake_joints": ImplicitActuatorCfg(
                 # Use regex matching your joint names, or list them
-                joint_names_expr=["joint_[1-9]"], # Example regex
-                effort_limit=100000.0,   # <<< Tune based on your robot's specs
+                joint_names_expr=["joint_1"], # Example regex
+                effort_limit=10000.0,   # <<< Tune based on your robot's specs
                 velocity_limit=10.0,  # <<< Tune based on your robot's specs
-                stiffness=0.0,       # <<< Tune: Use >0 for position/velocity control
-                damping=100000.0,        # <<< Tune: Use >0 for position/velocity control (helps stability)
+                stiffness=100000.0,       # <<< Tune: Use >0 for position/velocity control
+                damping=500.0,        # <<< Tune: Use >0 for position/velocity control (helps stability)
             ),
             # Add more actuator groups if joints have different properties
         },
@@ -97,8 +89,8 @@ class SnakeEnvCfg(DirectRLEnvCfg):
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="average",
             restitution_combine_mode="average",
-            static_friction=0.9,
-            dynamic_friction=0.6,
+            static_friction=1.0,
+            dynamic_friction=0.7,
             restitution=0.0,
         ),
         debug_vis=False,
@@ -172,6 +164,20 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     observation_history: ObservationHistoryCfg = ObservationHistoryCfg()
     # --- END OBSERVATION HISTORY CONFIGURATION ---
 
+     # --- ADD TESTING CONFIGURATION ---
+    @configclass
+    class TestingCfg:
+        """Configuration for testing modes."""
+        # Set to True to override RL actions with manual oscillation
+        enable_manual_oscillation: bool = True
+        # Oscillation amplitude in degrees (will be converted to radians)
+        oscillation_amplitude_deg: float = 60.0
+        # Oscillation frequency in Hertz
+        oscillation_frequency_hz: float = 1.0 # How many full cycles per second
+
+    testing: TestingCfg = TestingCfg()
+    # --- END TESTING CONFIGURATION ---
+
 class SnakeEnv(DirectRLEnv):
     cfg: SnakeEnvCfg
 
@@ -182,74 +188,32 @@ class SnakeEnv(DirectRLEnv):
         self.env_step_counter = 0
         #TODO: Need to make sure all the required information is used and set here!!
         # Currently its just some random stuff!
+        # Get joint limits
         
-        # Define which links to track for velocity
-        self.tracked_link_indices = torch.tensor([1, 5, 10], device=self.device)
-        
-        self.track_positions = self.cfg.position_tracking.enable # Use the flag from config
-        if self.track_positions:
-            self.tracking_env_id = self.cfg.position_tracking.env_id
-            self.tracking_joint_id = self.cfg.position_tracking.joint_id
-            self.track_all_joints = self.cfg.position_tracking.track_all_joints
-            self.max_tracking_points = self.cfg.position_tracking.max_points
-            
-            # Initialize velocity tracking data structure 
-            self.position_tracking_data = {
-                "timesteps": [],
-                "commanded_velocities": [],
-                "actual_velocities": [],
-            }
-            
-            if self.track_all_joints:
-                print(f"[Info] Velocity tracking enabled for all joints in Env {self.tracking_env_id}.")
-            else:
-                print(f"[Info] Velocity tracking enabled for Env {self.tracking_env_id}, Joint {self.tracking_joint_id}.")
-            print(f"       Plots will be saved when you terminate the simulation (Ctrl+C).")
-            
-            # Set up signal handler for SIGINT (Ctrl+C)
-            import signal
-            def signal_handler(sig, frame):
-                print("\nCaught interrupt signal. Saving velocity tracking plot before exiting...")
-                self.save_position_tracking_plot()
-                print("Plot saved. Exiting...")
-                import sys
-                sys.exit(0)
-            
-            # Register the signal handler for SIGINT
-            signal.signal(signal.SIGINT, signal_handler)
-        
-        # --- Initialize observation history ---
-        self.use_history = self.cfg.observation_history.enable
-        if self.use_history:
-            self.history_length = self.cfg.observation_history.history_length
-            print(f"[Info] Observation history enabled with {self.history_length} frames.")
-            
-            # Calculate the size of a single observation
-            single_obs_size = self._get_single_observation_size()
-            
-            # Initialize the observation history buffer with zeros
-            # Shape: [num_envs, history_length, single_obs_size]
-            self.obs_history = torch.zeros(
-                (self.num_envs, self.history_length, single_obs_size), 
-                device=self.device
-            )
-        # --- End observation history initialization ---
- 
+        # all_limits = self.snake_robot.data.soft_joint_pos_limits
+
+        # Store lower and upper limits separately for all envs
+        # Shape will be (num_envs, num_joints) -> (4096, 1)
+        # self.joint_pos_lower_limits = all_limits[..., 0].to(self.device) # Ellipsis (...) means all preceding dims
+        # self.joint_pos_upper_limits = all_limits[..., 1].to(self.device)
+
         self.joint_pos_limits = self.snake_robot.data.soft_joint_pos_limits
         self.joint_pos_lower_limits = self.joint_pos_limits[..., 0].to(self.device) # Ellipsis (...) means all preceding dims
         self.joint_pos_upper_limits = self.joint_pos_limits[..., 1].to(self.device)
+        
         self.joint_pos_ranges = self.joint_pos_upper_limits - self.joint_pos_lower_limits + 1e-6
         self.joint_pos_mid = (self.joint_pos_lower_limits + self.joint_pos_upper_limits) / 2
 
-        # Initialize velocity target buffers
-        self.joint_vel_targets = torch.zeros((self.num_envs, self.snake_robot.num_joints), device=self.device)
-        self.prev_actions = torch.zeros((self.num_envs, self.snake_robot.num_joints), device=self.device)
+        # Initialize action history
+        # Start with default positions, cloned to avoid modifying the default tensor
+        self.dof_targets = self.snake_robot.data.default_joint_pos.clone().to(device=self.device)
+        self.prev_actions = torch.zeros((self.num_envs, self.cfg.action_space), device=self.device)
 
         # Cache common data tensors (optional)
         self.joint_pos = self.snake_robot.data.joint_pos
         self.joint_vel = self.snake_robot.data.joint_vel
         self.root_state = self.snake_robot.data.root_state_w
-
+    
     def _setup_scene(self):
         # Create snake robot articulation
         self.snake_robot = Articulation(self.cfg.robot)
@@ -275,72 +239,72 @@ class SnakeEnv(DirectRLEnv):
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self.env_step_counter += 1
         # Store action for smoothness calculations in reward
-        self.prev_actions = self.joint_vel_targets.clone()
-        
-        # Check if manual oscillation test mode is enabled
+        self.prev_actions = self.dof_targets.clone()
+         # Check if manual oscillation test mode is enabled
         if self.cfg.testing.enable_manual_oscillation:
-            # --- SIDEWINDING MOTION PATTERN ---
+            # --- MANUAL OSCILLATION LOGIC ---
             current_time = self.sim.current_time
 
-            # Parameters from config
             # Convert amplitude from degrees to radians
-            amplitude_x_rad = math.radians(self.cfg.testing.amplitude_x_deg)
-            amplitude_y_rad = math.radians(self.cfg.testing.amplitude_y_deg)
-            
-            # Angular frequencies
-            omega_x = self.cfg.testing.omega_x
-            omega_y = self.cfg.testing.omega_y
-            
-            # Phase offsets
-            delta_x = self.cfg.testing.delta_x
-            delta_y = self.cfg.testing.delta_y
-            
-            # Phase difference between patterns
-            phi = self.cfg.testing.phi
-            
-            # Number of joints
-            num_joints = self.snake_robot.num_joints
-            
-            # Create tensor to hold velocity targets
-            velocity_targets = torch.zeros((num_joints,), device=self.device)
-            
-            # Calculate velocity for each joint (derivative of position function)
-            for i in range(num_joints):
-                if i % 2 == 0:  # Even joints
-                    # velocity(n,t) = Ax * wx * cos(wx*t + n*deltax)
-                    velocity_targets[i] = amplitude_x_rad * omega_x * torch.cos(
-                        torch.tensor(omega_x * current_time + i * delta_x)
-                    )
-                else:  # Odd joints
-                    # velocity(n,t) = Ay * wy * cos(wy*t + n*deltay + phi)
-                    velocity_targets[i] = amplitude_y_rad * omega_y * torch.cos(
-                        torch.tensor(omega_y * current_time + i * delta_y + phi)
-                    )
-            
-            # Expand to all environments
-            self.joint_vel_targets[:] = velocity_targets.unsqueeze(0).expand(self.num_envs, -1)
-            
-            # Print debug info occasionally
-            if self.env_step_counter % 20 == 0:
-                print(f"Step: {self.env_step_counter}, Time: {current_time:.4f}")
-                print(f"Vel targets (first 3 joints, rad/s): {velocity_targets[:3].cpu().numpy().round(4)}")
-                
-                # Optional: Calculate and print expected positions (integral of velocity)
-                positions = []
-                for i in range(min(3, num_joints)):  # First 3 joints
-                    if i % 2 == 0:  # Even joints
-                        pos = amplitude_x_rad * torch.sin(torch.tensor(omega_x * current_time + i * delta_x))
-                    else:  # Odd joints
-                        pos = amplitude_y_rad * torch.sin(torch.tensor(omega_y * current_time + i * delta_y + phi))
-                    positions.append(pos.item())
-                print(f"Expected pos (first 3 joints, rad): {np.array(positions).round(4)}")
-                    
-            # Set self.actions for potential use in reward calculations
-            self.actions = torch.zeros_like(actions)
-            
+            amplitude_rad = math.radians(self.cfg.testing.oscillation_amplitude_deg)
+            # Calculate angular frequency
+            omega = -2.0 * math.pi * self.cfg.testing.oscillation_frequency_hz
+
+            # Calculate the target angle based on a sine wave
+            # Target = Amplitude * sin(omega * time)
+            target_angle_rad = amplitude_rad * math.sin(omega * current_time)
+            if self.env_step_counter % 10 == 0: # Print every 10 steps
+                print(f"Step: {self.env_step_counter}, Time: {current_time:.4f}, Target Angle (rad): {target_angle_rad*180/math.pi:.4f}")
+            # Create a tensor with the target angle for all environments and joints
+            # Shape: (num_envs, num_joints) -> (4096, 1)
+            manual_targets = torch.full(
+                (self.num_envs, self.cfg.action_space),
+                target_angle_rad,
+                device=self.device,
+                dtype=torch.float32
+            )
+
+            # Clamp the manually set targets to the joint limits (IMPORTANT!)
+            # Use the correctly shaped limits (num_envs, num_joints)
+            clamped_manual_targets = torch.clamp(
+                manual_targets,
+                self.joint_pos_lower_limits,
+                self.joint_pos_upper_limits
+            )
+
+            # Set the DOF targets directly
+            self.dof_targets[:] = clamped_manual_targets
+
+            # Optional: Set self.actions for potential use in reward calculations,
+            # although rewards might not be meaningful in this test mode.
+            # Setting to zeros or the scaled target might be reasonable.
+            self.actions = torch.zeros_like(actions) # Or some other placeholder
+
+            # --- END MANUAL OSCILLATION LOGIC ---
+
         else:
-            # Process actions from the policy for VELOCITY CONTROL
+
+            # Process actions from the policy for POSITION CONTROL
             self.actions = actions.clone().clamp_(-1.0, 1.0)
+
+            # Calculate the desired change in target position
+            # Scale action by action_scale and time step
+            # The time step scaling makes the effect somewhat independent of simulation frequency
+            delta_targets = self.action_scale * self.actions * self.cfg.sim.dt * self.cfg.decimation
+
+            # Get current joint positions
+            current_joint_pos = self.snake_robot.data.joint_pos
+
+            # Calculate new targets by adding the delta to current positions
+            new_targets = current_joint_pos + delta_targets
+
+            # # Clamp the targets to the joint limits - use unsqueeze to handle broadcasting correctly
+            # lower_limits = self.joint_pos_limits[:, 0].unsqueeze(0)  # Shape: [1, num_joints]
+            # upper_limits = self.joint_pos_limits[:, 1].unsqueeze(0)  # Shape: [1, num_joints]
+            
+            self.dof_targets[:] = torch.clamp(new_targets, self.joint_pos_lower_limits, self.joint_pos_upper_limits)
+            # Clamp the targets to the joint limits
+            # self.dof_targets[:] = torch.clamp(new_targets, self.joint_pos_limits[:, 0], self.joint_pos_limits[:,1])
 
             # Scale normalized actions to velocity targets
             # Map [-1, 1] to desired velocity range using action_scale
@@ -402,26 +366,13 @@ class SnakeEnv(DirectRLEnv):
             ),
             dim=-1,
         )
-        
-        if self.use_history:
-            # Shift the history buffer (discard oldest, make room for newest)
-            self.obs_history = self.obs_history.roll(-1, dims=1)
-            
-            # Insert the current observation as the newest entry
-            self.obs_history[:, -1, :] = current_obs
-            
-            # Flatten the history for the policy
-            # Shape goes from [num_envs, history_length, single_obs_size] 
-            # to [num_envs, history_length * single_obs_size]
-            policy_obs = self.obs_history.reshape(self.num_envs, -1)
-            
-            # Optional: add observation normalization if needed
-            # policy_obs = torch.clamp(policy_obs, -10.0, 10.0)
-            
-            observations = {"policy": policy_obs}
-        else:
-            # Just use the current observation if history is disabled
-            observations = {"policy": current_obs}
+        # obs = torch.clamp(obs, -10.0, 10.0)
+        # # Print stats to debug
+        # if self.reset_buf.sum() > 0:  # Only print during resets to avoid flooding logs
+        #     print(f"Obs min: {obs.min().item():.2f}, max: {obs.max().item():.2f}, mean: {obs.mean().item():.2f}")
+        #     if torch.isnan(obs).any():
+        #         print("WARNING: NaN values in observations!") 
+        observations = {"policy": obs}
         
         return observations
 
@@ -538,7 +489,10 @@ class SnakeEnv(DirectRLEnv):
         # up_world = quat_rotate(root_quat, up)
         # too_tilted = up_world[:, 2] < 0.0  # z component negative means flipped
         
-        # # terminated = head_too_low | too_tilted
+        # terminated = head_too_low | too_tilted
+        self.joint_pos = self.snake_robot.data.joint_pos
+        out_of_bounds = torch.any(self.joint_pos < self.joint_pos_lower_limits, dim=1) | \
+                        torch.any(self.joint_pos > self.joint_pos_upper_limits, dim=1)
         
         # Get joint position bounds check
         self.joint_pos = self.snake_robot.data.joint_pos
