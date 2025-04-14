@@ -29,22 +29,22 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     # env
     decimation = 2
     episode_length_s = 10.0
-    action_scale = 0.01  # rad #TODO: tune this
-    action_space = 9    # 9 joints
-    observation_space = 28 #TODO: fix this
+    action_scale = 1.0  # rad #TODO: tune this
+    action_space = 1    # 9 joints
+    observation_space = 12 #TODO: fix this
     state_space = 0
 
     # simulation
     sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation)
 
     # scene
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=64, env_spacing=4.0, replicate_physics=True)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=64, env_spacing=8.0, replicate_physics=True)
 
     # -- Robot Configuration (Loading from USD)
     robot: ArticulationCfg = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot", # Standard prim path pattern
         spawn=sim_utils.UsdFileCfg(
-            usd_path="/home/hzade/temp/snake_1.usd",
+            usd_path="/home/hzade/temp/snake_2_link.usd",
             activate_contact_sensors=False, # Set to True if you need contact sensors #TODO: check this
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=False,
@@ -60,27 +60,19 @@ class SnakeEnvCfg(DirectRLEnvCfg):
             # Define initial joint positions
             joint_pos={
                 "joint_1": 0.0,
-                "joint_2": 0.0,
-                "joint_3": 0.0,
-                "joint_4": 0.0,
-                "joint_5": 0.0,
-                "joint_6": 0.0,
-                "joint_7": 0.0,
-                "joint_8": 0.0,
-                "joint_9": 0.0,
             },
-            pos=(0.0, 0.0, 0.1),  # Initial base position (adjust height based on robot)
+            pos=(0.0, 0.0, 1.0),  # Initial base position (adjust height based on robot)
             rot=(0.0, 0.0, 0.0, 1.0), # Initial base orientation
         ),
         actuators={
             # Define actuators for your joints #TODO: tune all these parameters
             "snake_joints": ImplicitActuatorCfg(
                 # Use regex matching your joint names, or list them
-                joint_names_expr=["joint_[1-9]"], # Example regex
-                effort_limit=100.0,   # <<< Tune based on your robot's specs
+                joint_names_expr=["joint_1"], # Example regex
+                effort_limit=10000.0,   # <<< Tune based on your robot's specs
                 velocity_limit=10.0,  # <<< Tune based on your robot's specs
-                stiffness=1000.0,       # <<< Tune: Use >0 for position/velocity control
-                damping=10.0,        # <<< Tune: Use >0 for position/velocity control (helps stability)
+                stiffness=100000.0,       # <<< Tune: Use >0 for position/velocity control
+                damping=500.0,        # <<< Tune: Use >0 for position/velocity control (helps stability)
             ),
             # Add more actuator groups if joints have different properties
         },
@@ -96,7 +88,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
             friction_combine_mode="average",
             restitution_combine_mode="average",
             static_friction=1.0,
-            dynamic_friction=1.0,
+            dynamic_friction=0.7,
             restitution=0.0,
         ),
         debug_vis=False,
@@ -119,36 +111,56 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     rew_scale_lateral_velocity_penalty = -0.05 #-0.05
     rew_scale_joint_limit_penalty = -0.1 #-0.1
 
+     # --- ADD TESTING CONFIGURATION ---
+    @configclass
+    class TestingCfg:
+        """Configuration for testing modes."""
+        # Set to True to override RL actions with manual oscillation
+        enable_manual_oscillation: bool = True
+        # Oscillation amplitude in degrees (will be converted to radians)
+        oscillation_amplitude_deg: float = 60.0
+        # Oscillation frequency in Hertz
+        oscillation_frequency_hz: float = 1.0 # How many full cycles per second
+
+    testing: TestingCfg = TestingCfg()
+    # --- END TESTING CONFIGURATION ---
+
 class SnakeEnv(DirectRLEnv):
     cfg: SnakeEnvCfg
 
     def __init__(self, cfg: SnakeEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
-
-        self.action_scale = self.cfg.action_scale
         
+        self.action_scale = self.cfg.action_scale
+        self.env_step_counter = 0
         #TODO: Need to make sure all the required information is used and set here!!
         # Currently its just some random stuff!
         # Get joint limits
-        self.joint_pos_limits = self.snake_robot.data.soft_joint_pos_limits[0]
-        self.joint_pos_ranges = self.joint_pos_limits[:, 1] - self.joint_pos_limits[:, 0]
-        self.joint_pos_mid = (self.joint_pos_limits[:, 0] + self.joint_pos_limits[:, 1]) / 2
+        
+        # all_limits = self.snake_robot.data.soft_joint_pos_limits
+
+        # Store lower and upper limits separately for all envs
+        # Shape will be (num_envs, num_joints) -> (4096, 1)
+        # self.joint_pos_lower_limits = all_limits[..., 0].to(self.device) # Ellipsis (...) means all preceding dims
+        # self.joint_pos_upper_limits = all_limits[..., 1].to(self.device)
+
+        self.joint_pos_limits = self.snake_robot.data.soft_joint_pos_limits
+        self.joint_pos_lower_limits = self.joint_pos_limits[..., 0].to(self.device) # Ellipsis (...) means all preceding dims
+        self.joint_pos_upper_limits = self.joint_pos_limits[..., 1].to(self.device)
+        
+        self.joint_pos_ranges = self.joint_pos_upper_limits - self.joint_pos_lower_limits + 1e-6
+        self.joint_pos_mid = (self.joint_pos_lower_limits + self.joint_pos_upper_limits) / 2
 
         # Initialize action history
         # Start with default positions, cloned to avoid modifying the default tensor
         self.dof_targets = self.snake_robot.data.default_joint_pos.clone().to(device=self.device)
         self.prev_actions = torch.zeros((self.num_envs, self.cfg.action_space), device=self.device)
 
-        # Ensure it has the correct shape for all envs
-        if self.num_envs > 1:
-             self.dof_targets = self.dof_targets.repeat(self.num_envs, 1)
-
         # Cache common data tensors (optional)
         self.joint_pos = self.snake_robot.data.joint_pos
         self.joint_vel = self.snake_robot.data.joint_vel
         self.root_state = self.snake_robot.data.root_state_w
-
-        
+    
     def _setup_scene(self):
         # Create snake robot articulation
         self.snake_robot = Articulation(self.cfg.robot)
@@ -172,25 +184,74 @@ class SnakeEnv(DirectRLEnv):
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
+        self.env_step_counter += 1
         # Store action for smoothness calculations in reward
         self.prev_actions = self.dof_targets.clone()
+         # Check if manual oscillation test mode is enabled
+        if self.cfg.testing.enable_manual_oscillation:
+            # --- MANUAL OSCILLATION LOGIC ---
+            current_time = self.sim.current_time
 
-         # Process actions from the policy for POSITION CONTROL
-        self.actions = actions.clone().clamp_(-1.0, 1.0)
+            # Convert amplitude from degrees to radians
+            amplitude_rad = math.radians(self.cfg.testing.oscillation_amplitude_deg)
+            # Calculate angular frequency
+            omega = -2.0 * math.pi * self.cfg.testing.oscillation_frequency_hz
 
-        # Calculate the desired change in target position
-        # Scale action by action_scale and time step
-        # The time step scaling makes the effect somewhat independent of simulation frequency
-        delta_targets = self.action_scale * self.actions * self.cfg.sim.dt * self.cfg.decimation
+            # Calculate the target angle based on a sine wave
+            # Target = Amplitude * sin(omega * time)
+            target_angle_rad = amplitude_rad * math.sin(omega * current_time)
+            if self.env_step_counter % 10 == 0: # Print every 10 steps
+                print(f"Step: {self.env_step_counter}, Time: {current_time:.4f}, Target Angle (rad): {target_angle_rad*180/math.pi:.4f}")
+            # Create a tensor with the target angle for all environments and joints
+            # Shape: (num_envs, num_joints) -> (4096, 1)
+            manual_targets = torch.full(
+                (self.num_envs, self.cfg.action_space),
+                target_angle_rad,
+                device=self.device,
+                dtype=torch.float32
+            )
 
-        # Get current joint positions
-        current_joint_pos = self.snake_robot.data.joint_pos
+            # Clamp the manually set targets to the joint limits (IMPORTANT!)
+            # Use the correctly shaped limits (num_envs, num_joints)
+            clamped_manual_targets = torch.clamp(
+                manual_targets,
+                self.joint_pos_lower_limits,
+                self.joint_pos_upper_limits
+            )
 
-        # Calculate new targets by adding the delta to current positions
-        new_targets = current_joint_pos + delta_targets
+            # Set the DOF targets directly
+            self.dof_targets[:] = clamped_manual_targets
 
-        # Clamp the targets to the joint limits
-        self.dof_targets[:] = torch.clamp(new_targets, self.joint_pos_limits[:, 0], self.joint_pos_limits[:,1])
+            # Optional: Set self.actions for potential use in reward calculations,
+            # although rewards might not be meaningful in this test mode.
+            # Setting to zeros or the scaled target might be reasonable.
+            self.actions = torch.zeros_like(actions) # Or some other placeholder
+
+            # --- END MANUAL OSCILLATION LOGIC ---
+
+        else:
+
+            # Process actions from the policy for POSITION CONTROL
+            self.actions = actions.clone().clamp_(-1.0, 1.0)
+
+            # Calculate the desired change in target position
+            # Scale action by action_scale and time step
+            # The time step scaling makes the effect somewhat independent of simulation frequency
+            delta_targets = self.action_scale * self.actions * self.cfg.sim.dt * self.cfg.decimation
+
+            # Get current joint positions
+            current_joint_pos = self.snake_robot.data.joint_pos
+
+            # Calculate new targets by adding the delta to current positions
+            new_targets = current_joint_pos + delta_targets
+
+            # # Clamp the targets to the joint limits - use unsqueeze to handle broadcasting correctly
+            # lower_limits = self.joint_pos_limits[:, 0].unsqueeze(0)  # Shape: [1, num_joints]
+            # upper_limits = self.joint_pos_limits[:, 1].unsqueeze(0)  # Shape: [1, num_joints]
+            
+            self.dof_targets[:] = torch.clamp(new_targets, self.joint_pos_lower_limits, self.joint_pos_upper_limits)
+            # Clamp the targets to the joint limits
+            # self.dof_targets[:] = torch.clamp(new_targets, self.joint_pos_limits[:, 0], self.joint_pos_limits[:,1])
 
 
     def _apply_action(self) -> None:
@@ -200,10 +261,9 @@ class SnakeEnv(DirectRLEnv):
         # Get joint positions and velocities
         joint_pos = self.snake_robot.data.joint_pos
         joint_vel = self.snake_robot.data.joint_vel
-        
+
         # # Calculate joint positions normalized to [-1, 1]
-        joint_pos_normalized = 2.0 * (joint_pos - self.joint_pos_limits[:, 0]) / self.joint_pos_ranges - 1.0
-        
+        joint_pos_normalized = 2.0 * (joint_pos - self.joint_pos_lower_limits) / self.joint_pos_ranges - 1.0
         # Get root state information
         root_pos = self.snake_robot.data.root_pos_w
         root_quat = self.snake_robot.data.root_quat_w
@@ -220,8 +280,14 @@ class SnakeEnv(DirectRLEnv):
             ),
             dim=-1,
         )
-        
+        # obs = torch.clamp(obs, -10.0, 10.0)
+        # # Print stats to debug
+        # if self.reset_buf.sum() > 0:  # Only print during resets to avoid flooding logs
+        #     print(f"Obs min: {obs.min().item():.2f}, max: {obs.max().item():.2f}, mean: {obs.mean().item():.2f}")
+        #     if torch.isnan(obs).any():
+        #         print("WARNING: NaN values in observations!") 
         observations = {"policy": obs}
+        
         return observations
 
     def _get_rewards(self) -> torch.Tensor:
@@ -298,8 +364,8 @@ class SnakeEnv(DirectRLEnv):
         
         # terminated = head_too_low | too_tilted
         self.joint_pos = self.snake_robot.data.joint_pos
-        out_of_bounds = torch.any(self.joint_pos < self.joint_pos_limits[:, 0]) | \
-                        torch.any(self.joint_pos > self.joint_pos_limits[:, 1])
+        out_of_bounds = torch.any(self.joint_pos < self.joint_pos_lower_limits, dim=1) | \
+                        torch.any(self.joint_pos > self.joint_pos_upper_limits, dim=1)
         
         return out_of_bounds, time_out
 
@@ -332,8 +398,8 @@ class SnakeEnv(DirectRLEnv):
         # Ensure joints are within limits
         joint_pos = torch.clamp(
             joint_pos,
-            self.joint_pos_limits[:, 0],
-            self.joint_pos_limits[:, 1]
+            self.joint_pos_lower_limits[env_ids],
+            self.joint_pos_upper_limits[env_ids]
         )
         
         # Zero velocities
