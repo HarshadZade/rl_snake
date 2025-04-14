@@ -43,7 +43,7 @@ params:
     normalize_input: True
     normalize_value: True
     value_bootstrap: True
-    num_actors: 64
+    num_actors: 4096
     device: "cuda:0" 
     reward_shaper:
       scale_value: 0.01
@@ -54,7 +54,7 @@ params:
     lr_schedule: adaptive
     kl_threshold: 0.008
     score_to_win: 20000
-    max_epochs: 1000
+    max_epochs: 5000
     save_best_after: 50
     save_frequency: 50
     grad_norm: 1.0
