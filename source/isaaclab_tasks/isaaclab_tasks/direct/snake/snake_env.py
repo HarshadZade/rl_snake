@@ -29,10 +29,10 @@ from isaaclab.terrains import TerrainImporter
 class SnakeEnvCfg(DirectRLEnvCfg):
     # env
     decimation = 2
-    episode_length_s = 10.0
-    action_scale = 1.0  # rad #TODO: tune this
-    action_space = 1    # 9 joints
-    observation_space = 12 #TODO: fix this
+    episode_length_s = 100.0
+    action_scale = 0.01  # rad #TODO: tune this
+    action_space = 9    # 9 joints
+    observation_space = 28 #TODO: fix this
     state_space = 0
     link_length = 4.0  #TODO: Get this from the USD instead of hardcoding # Length of each link in meters, used for height termination
 
@@ -40,7 +40,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation)
 
     # scene
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=64, env_spacing=8.0, replicate_physics=True)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=40.0, replicate_physics=True)
 
     # -- Robot Configuration (Loading from USD)
     robot: ArticulationCfg = ArticulationCfg(
@@ -89,8 +89,8 @@ class SnakeEnvCfg(DirectRLEnvCfg):
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="average",
             restitution_combine_mode="average",
-            static_friction=1.0,
-            dynamic_friction=0.7,
+            static_friction=0.9,
+            dynamic_friction=0.6,
             restitution=0.0,
         ),
         debug_vis=False,
@@ -169,7 +169,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     class TestingCfg:
         """Configuration for testing modes."""
         # Set to True to override RL actions with manual oscillation
-        enable_manual_oscillation: bool = True
+        enable_manual_oscillation: bool = False
         # Oscillation amplitude in degrees (will be converted to radians)
         oscillation_amplitude_deg: float = 60.0
         # Oscillation frequency in Hertz
