@@ -29,22 +29,22 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     # env
     decimation = 2
     episode_length_s = 10.0
-    action_scale = 1.0  # rad #TODO: tune this
-    action_space = 1    # 9 joints
-    observation_space = 12 #TODO: fix this
+    action_scale = 0.01  # rad #TODO: tune this
+    action_space = 9    # 9 joints
+    observation_space = 28 #TODO: fix this
     state_space = 0
 
     # simulation
     sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation)
 
     # scene
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=64, env_spacing=8.0, replicate_physics=True)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=64, env_spacing=25.0, replicate_physics=True)
 
     # -- Robot Configuration (Loading from USD)
     robot: ArticulationCfg = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot", # Standard prim path pattern
         spawn=sim_utils.UsdFileCfg(
-            usd_path="/home/hzade/temp/snake_2_link.usd",
+            usd_path="/home/hzade/temp/snake_1.usd",
             activate_contact_sensors=False, # Set to True if you need contact sensors #TODO: check this
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=False,
@@ -59,7 +59,15 @@ class SnakeEnvCfg(DirectRLEnvCfg):
         init_state=ArticulationCfg.InitialStateCfg(
             # Define initial joint positions
             joint_pos={
-                "joint_1": 0.0,
+                 "joint_1": 0.0,
+                 "joint_2": 0.0,
+                 "joint_3": 0.0,
+                 "joint_4": 0.0,
+                 "joint_5": 0.0,
+                 "joint_6": 0.0,
+                 "joint_7": 0.0,
+                 "joint_8": 0.0,
+                 "joint_9": 0.0,
             },
             pos=(0.0, 0.0, 1.0),  # Initial base position (adjust height based on robot)
             rot=(0.0, 0.0, 0.0, 1.0), # Initial base orientation
@@ -68,8 +76,8 @@ class SnakeEnvCfg(DirectRLEnvCfg):
             # Define actuators for your joints #TODO: tune all these parameters
             "snake_joints": ImplicitActuatorCfg(
                 # Use regex matching your joint names, or list them
-                joint_names_expr=["joint_1"], # Example regex
-                effort_limit=10000.0,   # <<< Tune based on your robot's specs
+                joint_names_expr=["joint_[1-9]"], # Example regex
+                effort_limit=50000.0,   # <<< Tune based on your robot's specs
                 velocity_limit=10.0,  # <<< Tune based on your robot's specs
                 stiffness=100000.0,       # <<< Tune: Use >0 for position/velocity control
                 damping=500.0,        # <<< Tune: Use >0 for position/velocity control (helps stability)
@@ -87,8 +95,8 @@ class SnakeEnvCfg(DirectRLEnvCfg):
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="average",
             restitution_combine_mode="average",
-            static_friction=1.0,
-            dynamic_friction=0.7,
+            static_friction=0.0,
+            dynamic_friction=0.0,
             restitution=0.0,
         ),
         debug_vis=False,
@@ -118,7 +126,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
         # Set to True to override RL actions with manual oscillation
         enable_manual_oscillation: bool = True
         # Oscillation amplitude in degrees (will be converted to radians)
-        oscillation_amplitude_deg: float = 60.0
+        oscillation_amplitude_deg: float = 30.0
         # Oscillation frequency in Hertz
         oscillation_frequency_hz: float = 1.0 # How many full cycles per second
 
@@ -187,47 +195,51 @@ class SnakeEnv(DirectRLEnv):
         self.env_step_counter += 1
         # Store action for smoothness calculations in reward
         self.prev_actions = self.dof_targets.clone()
-         # Check if manual oscillation test mode is enabled
+        # Check if manual oscillation test mode is enabled
         if self.cfg.testing.enable_manual_oscillation:
-            # --- MANUAL OSCILLATION LOGIC ---
+            # --- ALTERNATING SINE WAVE LOGIC ---
             current_time = self.sim.current_time
 
-            # Convert amplitude from degrees to radians
+            # Parameters from config
             amplitude_rad = math.radians(self.cfg.testing.oscillation_amplitude_deg)
-            # Calculate angular frequency
-            omega = -2.0 * math.pi * self.cfg.testing.oscillation_frequency_hz
+            omega = 2.0 * math.pi * self.cfg.testing.oscillation_frequency_hz
 
-            # Calculate the target angle based on a sine wave
-            # Target = Amplitude * sin(omega * time)
-            target_angle_rad = amplitude_rad * math.sin(omega * current_time)
-            if self.env_step_counter % 10 == 0: # Print every 10 steps
-                print(f"Step: {self.env_step_counter}, Time: {current_time:.4f}, Target Angle (rad): {target_angle_rad*180/math.pi:.4f}")
-            # Create a tensor with the target angle for all environments and joints
-            # Shape: (num_envs, num_joints) -> (4096, 1)
-            manual_targets = torch.full(
-                (self.num_envs, self.cfg.action_space),
-                target_angle_rad,
-                device=self.device,
-                dtype=torch.float32
-            )
+            # Create tensor of joint indices [0, 1, 2, ..., 8]
+            joint_indices = torch.arange(self.cfg.action_space, device=self.device) # Shape (9,)
 
-            # Clamp the manually set targets to the joint limits (IMPORTANT!)
-            # Use the correctly shaped limits (num_envs, num_joints)
+            # Calculate phase offset for each joint: 0, pi, 2*pi, 3*pi, ...
+            # This makes adjacent joints 180 degrees out of phase
+            phase_offsets = joint_indices * math.pi # Shape (9,)
+
+            # Calculate target angle for each joint at this time step
+            # target = Amp * sin(omega * t + phase_offset)
+            # Broadcasting: scalar * scalar + (9,) -> (9,)
+            target_angles_rad = amplitude_rad * torch.sin(omega * current_time + phase_offsets) # Shape (9,)
+
+            # Expand targets to all environments
+            # Shape: (1, 9) -> (num_envs, 9)
+            manual_targets = target_angles_rad.unsqueeze(0).expand(self.num_envs, -1)
+
+            # Clamp the manually set targets to the joint limits (shape num_envs, 9)
             clamped_manual_targets = torch.clamp(
                 manual_targets,
-                self.joint_pos_lower_limits,
-                self.joint_pos_upper_limits
+                self.joint_pos_lower_limits, # Shape (num_envs, 9)
+                self.joint_pos_upper_limits  # Shape (num_envs, 9)
             )
 
             # Set the DOF targets directly
             self.dof_targets[:] = clamped_manual_targets
 
-            # Optional: Set self.actions for potential use in reward calculations,
-            # although rewards might not be meaningful in this test mode.
-            # Setting to zeros or the scaled target might be reasonable.
-            self.actions = torch.zeros_like(actions) # Or some other placeholder
+            # --- Optional: Print targets for debugging ---
+            if self.env_step_counter % 20 == 0: # Print less often
+                # Print targets for the first environment
+                print(f"Step: {self.env_step_counter}, Time: {current_time:.4f}, "
+                        f"Targets (rad): {(self.dof_targets[0].cpu().numpy().round(4))*180/math.pi}")
+            # --- End Print ---
 
-            # --- END MANUAL OSCILLATION LOGIC ---
+            # Set self.actions for potential use in reward calculations (optional)
+            self.actions = torch.zeros_like(actions)
+            # --- END ALTERNATING SINE WAVE LOGIC ---
 
         else:
 
