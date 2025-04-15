@@ -124,7 +124,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     class TestingCfg:
         """Configuration for testing modes."""
         # Set to True to override RL actions with manual oscillation
-        enable_manual_oscillation: bool = False
+        enable_manual_oscillation: bool = True
         # Oscillation amplitude in degrees (will be converted to radians)
         oscillation_amplitude_deg: float = 30.0
         # Oscillation frequency in Hertz
@@ -132,6 +132,17 @@ class SnakeEnvCfg(DirectRLEnvCfg):
 
     testing: TestingCfg = TestingCfg()
     # --- END TESTING CONFIGURATION ---
+
+    @configclass
+    class PositionTrackingCfg:
+        """Configuration for position tracking analysis."""
+        enable: bool = True
+        env_id: int = 0     # Which environment to track
+        joint_id: int = 0   # Which joint to track
+        max_points: int = 1000  # Maximum number of data points to collect
+        save_interval_s: float = 10.0  # How often to save plots (seconds)
+    
+    position_tracking: PositionTrackingCfg = PositionTrackingCfg()
 
 class SnakeEnv(DirectRLEnv):
     cfg: SnakeEnvCfg
@@ -143,14 +154,23 @@ class SnakeEnv(DirectRLEnv):
         self.env_step_counter = 0
         #TODO: Need to make sure all the required information is used and set here!!
         # Currently its just some random stuff!
-        # Get joint limits
         
-        # all_limits = self.snake_robot.data.soft_joint_pos_limits
-
-        # Store lower and upper limits separately for all envs
-        # Shape will be (num_envs, num_joints) -> (4096, 1)
-        # self.joint_pos_lower_limits = all_limits[..., 0].to(self.device) # Ellipsis (...) means all preceding dims
-        # self.joint_pos_upper_limits = all_limits[..., 1].to(self.device)
+        # Set up position tracking from config
+        self.track_positions = self.cfg.position_tracking.enable
+        self.tracking_env_id = self.cfg.position_tracking.env_id
+        self.tracking_joint_id = self.cfg.position_tracking.joint_id
+        self.max_tracking_points = self.cfg.position_tracking.max_points
+        self.tracking_save_interval = self.cfg.position_tracking.save_interval_s
+        # Add tracking for actuator analysis
+        self.track_positions = True
+        self.position_tracking = {
+            "timesteps": [],
+            "commanded_positions": [],
+            "actual_positions": [],
+        }
+        self.tracking_env_id = 0  # Which environment to track (first one by default)
+        self.tracking_joint_id = 0  # Which joint to track (first one by default)
+        self.max_tracking_points = 1000  # Limit data points to avoid memory issues
 
         self.joint_pos_limits = self.snake_robot.data.soft_joint_pos_limits
         self.joint_pos_lower_limits = self.joint_pos_limits[..., 0].to(self.device) # Ellipsis (...) means all preceding dims
@@ -265,6 +285,26 @@ class SnakeEnv(DirectRLEnv):
             # Clamp the targets to the joint limits
             # self.dof_targets[:] = torch.clamp(new_targets, self.joint_pos_limits[:, 0], self.joint_pos_limits[:,1])
 
+        # After setting dof_targets, record the commanded position
+        if self.track_positions and len(self.position_tracking["timesteps"]) < self.max_tracking_points:
+            self.position_tracking["timesteps"].append(self.sim.current_time)
+            self.position_tracking["commanded_positions"].append(
+                self.dof_targets[self.tracking_env_id, self.tracking_joint_id].item()
+            )
+    
+    def _post_physics_step(self):
+        # Add this method to record actual positions after physics step
+        super()._post_physics_step()
+        print("###########IN THE POST PHYSICS STEP########################")
+        # Record the actual position
+        if self.track_positions and len(self.position_tracking["actual_positions"]) < len(self.position_tracking["commanded_positions"]):
+            self.position_tracking["actual_positions"].append(
+                self.snake_robot.data.joint_pos[self.tracking_env_id, self.tracking_joint_id].item()
+            )
+        
+        # Periodically save or plot the data
+        if self.track_positions and self.sim.current_time % 10.0 < self.sim.dt:  # Every 10 seconds
+            self.save_position_tracking()
 
     def _apply_action(self) -> None:
         self.snake_robot.set_joint_position_target(self.dof_targets)
@@ -433,3 +473,57 @@ class SnakeEnv(DirectRLEnv):
         else:
             self.dof_targets = joint_pos
             self.prev_actions = joint_pos
+
+    def save_position_tracking(self):
+        # Save the tracking data to a file
+        if not self.position_tracking["timesteps"]:
+            return
+            
+        import numpy as np
+        import matplotlib.pyplot as plt
+        from datetime import datetime
+        
+        # Create the plot
+        plt.figure(figsize=(12, 6))
+        times = np.array(self.position_tracking["timesteps"])
+        commanded = np.array(self.position_tracking["commanded_positions"])
+        actual = np.array(self.position_tracking["actual_positions"])
+        
+        # Only plot up to the length of the shortest array
+        min_len = min(len(times), len(commanded), len(actual))
+        
+        plt.plot(times[:min_len], commanded[:min_len], 'b-', label=f'Commanded Position (Joint {self.tracking_joint_id})')
+        plt.plot(times[:min_len], actual[:min_len], 'r-', label=f'Actual Position (Joint {self.tracking_joint_id})')
+        
+        plt.xlabel('Time (s)')
+        plt.ylabel('Joint Position (rad)')
+        plt.title(f'Joint Position Tracking - Env {self.tracking_env_id}, Joint {self.tracking_joint_id}')
+        plt.legend()
+        plt.grid(True)
+        
+        # Calculate position tracking error metrics
+        if min_len > 0:
+            error = commanded[:min_len] - actual[:min_len]
+            rmse = np.sqrt(np.mean(np.square(error)))
+            max_error = np.max(np.abs(error))
+            avg_error = np.mean(np.abs(error))
+            
+            plt.figtext(0.02, 0.02, 
+                      f'RMSE: {rmse:.4f} rad\nMax Error: {max_error:.4f} rad\nAvg Error: {avg_error:.4f} rad',
+                      bbox={'facecolor': 'white', 'alpha': 0.8, 'pad': 5})
+        
+        # Save the plot
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        plt.savefig(f'joint_tracking_env{self.tracking_env_id}_joint{self.tracking_joint_id}_{timestamp}.png')
+        plt.close()
+        
+        # Optional: Save the raw data as CSV
+        data = np.column_stack((times[:min_len], commanded[:min_len], actual[:min_len]))
+        np.savetxt(
+            f'joint_tracking_data_env{self.tracking_env_id}_joint{self.tracking_joint_id}_{timestamp}.csv',
+            data,
+            delimiter=',',
+            header='time,commanded_position,actual_position'
+        )
+        
+        print(f"Saved position tracking data and plot at t={self.sim.current_time:.2f}s")
