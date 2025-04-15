@@ -155,22 +155,36 @@ class SnakeEnv(DirectRLEnv):
         #TODO: Need to make sure all the required information is used and set here!!
         # Currently its just some random stuff!
         
-        # Set up position tracking from config
-        self.track_positions = self.cfg.position_tracking.enable
-        self.tracking_env_id = self.cfg.position_tracking.env_id
-        self.tracking_joint_id = self.cfg.position_tracking.joint_id
-        self.max_tracking_points = self.cfg.position_tracking.max_points
-        self.tracking_save_interval = self.cfg.position_tracking.save_interval_s
-        # Add tracking for actuator analysis
-        self.track_positions = True
-        self.position_tracking = {
-            "timesteps": [],
-            "commanded_positions": [],
-            "actual_positions": [],
-        }
-        self.tracking_env_id = 0  # Which environment to track (first one by default)
-        self.tracking_joint_id = 0  # Which joint to track (first one by default)
-        self.max_tracking_points = 1000  # Limit data points to avoid memory issues
+        # --- Use PositionTrackingCfg consistently ---
+        self.track_positions = self.cfg.position_tracking.enable # Use the flag from config
+        if self.track_positions:
+            self.tracking_env_id = self.cfg.position_tracking.env_id
+            self.tracking_joint_id = self.cfg.position_tracking.joint_id
+            self.max_tracking_points = self.cfg.position_tracking.max_points
+            
+            # Initialize position tracking data structure consistently
+            self.position_tracking_data = {
+                "timesteps": [],
+                "commanded_positions": [],
+                "actual_positions": [],
+            }
+            print(f"[Info] Position tracking enabled for Env {self.tracking_env_id}, Joint {self.tracking_joint_id}.")
+            print(f"       Plots will be saved when you terminate the simulation (Ctrl+C).")
+            
+            # Set up signal handler for SIGINT (Ctrl+C)
+            import signal
+            def signal_handler(sig, frame):
+                print("\nCaught interrupt signal. Saving position tracking plot before exiting...")
+                self.save_position_tracking_plot()
+                print("Plot saved. Exiting...")
+                import sys
+                sys.exit(0)
+            
+            # Register the signal handler for SIGINT
+            signal.signal(signal.SIGINT, signal_handler)
+            
+        # --- End config usage ---
+ 
 
         self.joint_pos_limits = self.snake_robot.data.soft_joint_pos_limits
         self.joint_pos_lower_limits = self.joint_pos_limits[..., 0].to(self.device) # Ellipsis (...) means all preceding dims
@@ -277,35 +291,20 @@ class SnakeEnv(DirectRLEnv):
             # Calculate new targets by adding the delta to current positions
             new_targets = current_joint_pos + delta_targets
 
+
+            # # Clamp the targets to the joint limits - use unsqueeze to handle broadcasting correctly
+            # lower_limits = self.joint_pos_limits[:, 0].unsqueeze(0)  # Shape: [1, num_joints]
+            # upper_limits = self.joint_pos_limits[:, 1].unsqueeze(0)  # Shape: [1, num_joints]
+            
+            
             # # Clamp the targets to the joint limits - use unsqueeze to handle broadcasting correctly
             # lower_limits = self.joint_pos_limits[:, 0].unsqueeze(0)  # Shape: [1, num_joints]
             # upper_limits = self.joint_pos_limits[:, 1].unsqueeze(0)  # Shape: [1, num_joints]
             
             self.dof_targets[:] = torch.clamp(new_targets, self.joint_pos_lower_limits, self.joint_pos_upper_limits)
-            # Clamp the targets to the joint limits
-            # self.dof_targets[:] = torch.clamp(new_targets, self.joint_pos_limits[:, 0], self.joint_pos_limits[:,1])
 
-        # After setting dof_targets, record the commanded position
-        if self.track_positions and len(self.position_tracking["timesteps"]) < self.max_tracking_points:
-            self.position_tracking["timesteps"].append(self.sim.current_time)
-            self.position_tracking["commanded_positions"].append(
-                self.dof_targets[self.tracking_env_id, self.tracking_joint_id].item()
-            )
+        # NOTE: Removed position tracking data collection from here - now done in step() method
     
-    def _post_physics_step(self):
-        # Add this method to record actual positions after physics step
-        super()._post_physics_step()
-        print("###########IN THE POST PHYSICS STEP########################")
-        # Record the actual position
-        if self.track_positions and len(self.position_tracking["actual_positions"]) < len(self.position_tracking["commanded_positions"]):
-            self.position_tracking["actual_positions"].append(
-                self.snake_robot.data.joint_pos[self.tracking_env_id, self.tracking_joint_id].item()
-            )
-        
-        # Periodically save or plot the data
-        if self.track_positions and self.sim.current_time % 10.0 < self.sim.dt:  # Every 10 seconds
-            self.save_position_tracking()
-
     def _apply_action(self) -> None:
         self.snake_robot.set_joint_position_target(self.dof_targets)
 
@@ -423,7 +422,7 @@ class SnakeEnv(DirectRLEnv):
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         if env_ids is None:
-            env_ids = self.snake_robot._ALL_INDICES
+            env_ids = []  # Use empty list instead of tensor to avoid type error
         super()._reset_idx(env_ids)
         
         # Reset joint positions to a neutral pose with small noise
@@ -474,23 +473,83 @@ class SnakeEnv(DirectRLEnv):
             self.dof_targets = joint_pos
             self.prev_actions = joint_pos
 
-    def save_position_tracking(self):
+    # --- Override the step method ---
+    def step(self, actions: torch.Tensor) -> tuple[dict, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+        """Override the main environment step to collect plotting data."""
+
+        # Before taking the step, record the current time and commanded position
+        current_time = self.sim.current_time
+        commanded_position = None
+        
+        if self.track_positions and len(self.position_tracking_data["timesteps"]) < self.max_tracking_points:
+            commanded_position = self.dof_targets[self.tracking_env_id, self.tracking_joint_id].item()
+
+        # --- Call the original DirectRLEnv step logic ---
+        # This handles: _pre_physics_step, sim.step(), _get_observations, _get_rewards, _get_dones, _reset_idx etc.
+        obs_dict, rew, terminated, truncated, extras = super().step(actions)
+        # --- End original step logic ---
+
+        # --- Collect BOTH commanded and actual position data AFTER physics step ---
+        if self.track_positions and commanded_position is not None:
+            # Get actual joint positions after the physics step
+            actual_pos = self.snake_robot.data.joint_pos[self.tracking_env_id, self.tracking_joint_id].item()
+
+            # Debug: print collection info occasionally
+            if self.env_step_counter % 100 == 0:
+                print(f"Collecting data point {len(self.position_tracking_data['timesteps'])} at time {self.sim.current_time:.2f}s")
+                print(f"  Commanded: {commanded_position:.4f}, Actual: {actual_pos:.4f}")
+            
+            # Save both data points
+            self.position_tracking_data["timesteps"].append(current_time)
+            self.position_tracking_data["commanded_positions"].append(commanded_position)
+            self.position_tracking_data["actual_positions"].append(actual_pos)
+
+            # No longer triggering plot saving periodically - will save on Ctrl+C via signal handler
+
+        return obs_dict, rew, terminated, truncated, extras
+    # --- End override ---
+    
+    def save_position_tracking_plot(self):
+        print("#############################################")
+        print("Saving position tracking plot")
+        print("#############################################")
+        
         # Save the tracking data to a file
-        if not self.position_tracking["timesteps"]:
+        if not self.position_tracking_data["timesteps"]:
+            print("No position tracking data to plot!")
             return
             
         import numpy as np
         import matplotlib.pyplot as plt
         from datetime import datetime
+        import os
+        
+        # Debug info about data collection
+        timesteps_count = len(self.position_tracking_data["timesteps"])
+        actual_count = len(self.position_tracking_data["actual_positions"])
+        cmd_count = len(self.position_tracking_data["commanded_positions"])
+        
+        print(f"Plotting data: timesteps={timesteps_count}, commanded={cmd_count}, actual={actual_count}")
+        
+        # Check if data lengths match
+        if timesteps_count != cmd_count or timesteps_count != actual_count:
+            print("WARNING: Data array lengths don't match!")
+            print(f"  timesteps: {timesteps_count}, commanded: {cmd_count}, actual: {actual_count}")
+            # Adjust the arrays to the same length if needed
+            min_len = min(timesteps_count, cmd_count, actual_count)
+            self.position_tracking_data["timesteps"] = self.position_tracking_data["timesteps"][:min_len]
+            self.position_tracking_data["commanded_positions"] = self.position_tracking_data["commanded_positions"][:min_len]
+            self.position_tracking_data["actual_positions"] = self.position_tracking_data["actual_positions"][:min_len]
         
         # Create the plot
         plt.figure(figsize=(12, 6))
-        times = np.array(self.position_tracking["timesteps"])
-        commanded = np.array(self.position_tracking["commanded_positions"])
-        actual = np.array(self.position_tracking["actual_positions"])
+        times = np.array(self.position_tracking_data["timesteps"])
+        commanded = np.array(self.position_tracking_data["commanded_positions"])
+        actual = np.array(self.position_tracking_data["actual_positions"])
         
         # Only plot up to the length of the shortest array
         min_len = min(len(times), len(commanded), len(actual))
+        print(f"Plotting {min_len} data points")
         
         plt.plot(times[:min_len], commanded[:min_len], 'b-', label=f'Commanded Position (Joint {self.tracking_joint_id})')
         plt.plot(times[:min_len], actual[:min_len], 'r-', label=f'Actual Position (Joint {self.tracking_joint_id})')
@@ -512,18 +571,25 @@ class SnakeEnv(DirectRLEnv):
                       f'RMSE: {rmse:.4f} rad\nMax Error: {max_error:.4f} rad\nAvg Error: {avg_error:.4f} rad',
                       bbox={'facecolor': 'white', 'alpha': 0.8, 'pad': 5})
         
+        # Create output directory if it doesn't exist
+        output_dir = os.path.join(os.getcwd(), "joint_tracking_plots")
+        os.makedirs(output_dir, exist_ok=True)
+        
         # Save the plot
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        plt.savefig(f'joint_tracking_env{self.tracking_env_id}_joint{self.tracking_joint_id}_{timestamp}.png')
+        filename = os.path.join(output_dir, f'joint_tracking_env{self.tracking_env_id}_joint{self.tracking_joint_id}_{timestamp}.png')
+        plt.savefig(filename)
         plt.close()
         
         # Optional: Save the raw data as CSV
         data = np.column_stack((times[:min_len], commanded[:min_len], actual[:min_len]))
+        csv_filename = os.path.join(output_dir, f'joint_tracking_data_env{self.tracking_env_id}_joint{self.tracking_joint_id}_{timestamp}.csv')
         np.savetxt(
-            f'joint_tracking_data_env{self.tracking_env_id}_joint{self.tracking_joint_id}_{timestamp}.csv',
+            csv_filename,
             data,
             delimiter=',',
             header='time,commanded_position,actual_position'
         )
         
-        print(f"Saved position tracking data and plot at t={self.sim.current_time:.2f}s")
+        print(f"Saved position tracking data and plot to {filename} at t={self.sim.current_time:.2f}s")
+        return filename
