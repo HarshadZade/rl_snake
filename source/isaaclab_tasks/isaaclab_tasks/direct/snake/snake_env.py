@@ -103,73 +103,22 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     # Action scale now determines how much the target velocity changes per RL step
     action_scale = 1.0  # rad/s - For velocity control, scale can be larger than position control
     
-    # reward scales 
-    rew_scale_forward_velocity = 0.0  # Not using this in LQR approach
-    rew_scale_joint_vel_penalty = -0.0001  # Small penalty on joint velocities (control cost)
-    rew_scale_termination = 0.0
-    rew_scale_alive = 1.0  # Small alive bonus
-    rew_scale_action_smoothness_penalty = 0.0
-    rew_scale_lateral_velocity_penalty = 0.0
-    rew_scale_joint_limit_penalty = -5.0  # Keep joint limit penalty
-    
-    # LQR reward parameters
-    rew_scale_state_tracking = 10.0  # Weight for state tracking term
-    rew_scale_control_cost = -0.001  # Weight for control cost term
-    
-    # --- ADD TESTING CONFIGURATION ---
-    @configclass
-    class TestingCfg:
-        """Configuration for testing modes."""
-        # Set to True to override RL actions with manual oscillation
-        enable_manual_oscillation: bool = False
-        
-        # --- Sidewinding parameters ---
-        # Amplitude in degrees (will be converted to radians)
-        amplitude_x_deg: float = 30.0  # Amplitude for even joints
-        amplitude_y_deg: float = 30.0  # Amplitude for odd joints
-        
-        # Angular frequency
-        omega_x: float = 5.0 * math.pi / 6.0  # Angular frequency for even joints
-        omega_y: float = 5.0 * math.pi / 6.0  # Angular frequency for odd joints
-        
-        # Phase offset per joint
-        delta_x: float = 2.0 * math.pi / 3.0  # Phase offset per even joint
-        delta_y: float = 2.0 * math.pi / 3.0  # Phase offset per odd joint
-        
-        # Phase difference between even and odd joints
-        phi: float = 0.0
-
-    testing: TestingCfg = TestingCfg()
-    # --- END TESTING CONFIGURATION ---
-
-    @configclass
-    class PositionTrackingCfg:
-        """Configuration for velocity tracking analysis."""
-        enable: bool = True
-        env_id: int = 0     # Which environment to track
-        track_all_joints: bool = True  # Whether to track all joints or just one
-        joint_id: int = 0   # Which joint to track (if not tracking all)
-        max_points: int = 1000  # Maximum number of data points to collect
-        save_interval_s: float = 10.0  # How often to save plots (seconds)
-    
-    position_tracking: PositionTrackingCfg = PositionTrackingCfg()
-    
-    # --- ADD OBSERVATION HISTORY CONFIGURATION ---
-    @configclass
-    class ObservationHistoryCfg:
-        """Configuration for observation history."""
-        enable: bool = True
-        history_length: int = 3  # How many past observations to include (including current)
-    
-    observation_history: ObservationHistoryCfg = ObservationHistoryCfg()
-    # --- END OBSERVATION HISTORY CONFIGURATION ---
+    # reward scales #TODO: check if this makes sense, get the correct ones.
+    rew_scale_forward_velocity = 100.0
+    rew_scale_action_penalty = -0.005 #-0.005
+    rew_scale_joint_vel_penalty = -0.001 #-0.001
+    rew_scale_termination = -0.05 #-2.0
+    rew_scale_alive = 0.1
+    rew_scale_action_smoothness_penalty = -0.05 #-0.05
+    rew_scale_lateral_velocity_penalty = -0.005 #-0.05
+    rew_scale_joint_limit_penalty = -0.1 #-0.1
 
      # --- ADD TESTING CONFIGURATION ---
     @configclass
     class TestingCfg:
         """Configuration for testing modes."""
         # Set to True to override RL actions with manual oscillation
-        enable_manual_oscillation: bool = True
+        enable_manual_oscillation: bool = False
         # Oscillation amplitude in degrees (will be converted to radians)
         oscillation_amplitude_deg: float = 60.0
         # Oscillation frequency in Hertz
@@ -188,6 +137,16 @@ class SnakeEnvCfg(DirectRLEnvCfg):
         save_interval_s: float = 10.0  # How often to save plots (seconds)
     
     position_tracking: PositionTrackingCfg = PositionTrackingCfg()
+    
+    # --- ADD OBSERVATION HISTORY CONFIGURATION ---
+    @configclass
+    class ObservationHistoryCfg:
+        """Configuration for observation history."""
+        enable: bool = True
+        history_length: int = 3  # How many past observations to include (including current)
+    
+    observation_history: ObservationHistoryCfg = ObservationHistoryCfg()
+    # --- END OBSERVATION HISTORY CONFIGURATION ---
 
 class SnakeEnv(DirectRLEnv):
     cfg: SnakeEnvCfg
@@ -200,7 +159,6 @@ class SnakeEnv(DirectRLEnv):
         #TODO: Need to make sure all the required information is used and set here!!
         # Currently its just some random stuff!
         
-        # --- Use PositionTrackingCfg consistently ---
         self.track_positions = self.cfg.position_tracking.enable # Use the flag from config
         if self.track_positions:
             self.tracking_env_id = self.cfg.position_tracking.env_id
@@ -227,10 +185,24 @@ class SnakeEnv(DirectRLEnv):
             
             # Register the signal handler for SIGINT
             signal.signal(signal.SIGINT, signal_handler)
+        
+        # --- Initialize observation history ---
+        self.use_history = self.cfg.observation_history.enable
+        if self.use_history:
+            self.history_length = self.cfg.observation_history.history_length
+            print(f"[Info] Observation history enabled with {self.history_length} frames.")
             
-        # --- End config usage ---
+            # Calculate the size of a single observation
+            single_obs_size = self._get_single_observation_size()
+            
+            # Initialize the observation history buffer with zeros
+            # Shape: [num_envs, history_length, single_obs_size]
+            self.obs_history = torch.zeros(
+                (self.num_envs, self.history_length, single_obs_size), 
+                device=self.device
+            )
+        # --- End observation history initialization ---
  
-
         self.joint_pos_limits = self.snake_robot.data.soft_joint_pos_limits
         self.joint_pos_lower_limits = self.joint_pos_limits[..., 0].to(self.device) # Ellipsis (...) means all preceding dims
         self.joint_pos_upper_limits = self.joint_pos_limits[..., 1].to(self.device)
@@ -331,16 +303,6 @@ class SnakeEnv(DirectRLEnv):
 
             # Calculate new targets by adding the delta to current positions
             new_targets = current_joint_pos + delta_targets
-
-
-            # # Clamp the targets to the joint limits - use unsqueeze to handle broadcasting correctly
-            # lower_limits = self.joint_pos_limits[:, 0].unsqueeze(0)  # Shape: [1, num_joints]
-            # upper_limits = self.joint_pos_limits[:, 1].unsqueeze(0)  # Shape: [1, num_joints]
-            
-            
-            # # Clamp the targets to the joint limits - use unsqueeze to handle broadcasting correctly
-            # lower_limits = self.joint_pos_limits[:, 0].unsqueeze(0)  # Shape: [1, num_joints]
-            # upper_limits = self.joint_pos_limits[:, 1].unsqueeze(0)  # Shape: [1, num_joints]
             
             self.dof_targets[:] = torch.clamp(new_targets, self.joint_pos_lower_limits, self.joint_pos_upper_limits)
 
@@ -349,6 +311,32 @@ class SnakeEnv(DirectRLEnv):
     def _apply_action(self) -> None:
         # Use velocity control instead of position control
         self.snake_robot.set_joint_velocity_target(self.joint_vel_targets)
+
+    def _get_single_observation_size(self):
+        """Calculate the size of a single observation (without history)."""
+        # Get joint positions and velocities
+        joint_pos = self.snake_robot.data.joint_pos
+        joint_vel = self.snake_robot.data.joint_vel
+        
+        # Calculate a single observation
+        single_obs = torch.cat(
+            (
+                # Normalized joint positions (shape: num_envs x 9)
+                torch.zeros_like(joint_pos),
+                # Scaled joint velocities (shape: num_envs x 9)
+                torch.zeros_like(joint_vel),
+                # Root position (shape: num_envs x 3)
+                torch.zeros((self.num_envs, 3), device=self.device),
+                # Root orientation (shape: num_envs x 4)
+                torch.zeros((self.num_envs, 4), device=self.device),
+                # Root linear velocity (shape: num_envs x 3)
+                torch.zeros((self.num_envs, 3), device=self.device),
+            ),
+            dim=-1,
+        )
+        
+        # Return the size of the last dimension (observation features)
+        return single_obs.shape[-1]
 
     def _get_single_observation_size(self):
         """Calculate the size of a single observation (without history)."""
@@ -399,13 +387,30 @@ class SnakeEnv(DirectRLEnv):
             ),
             dim=-1,
         )
-        # obs = torch.clamp(obs, -10.0, 10.0)
-        # # Print stats to debug
-        # if self.reset_buf.sum() > 0:  # Only print during resets to avoid flooding logs
-        #     print(f"Obs min: {obs.min().item():.2f}, max: {obs.max().item():.2f}, mean: {obs.mean().item():.2f}")
-        #     if torch.isnan(obs).any():
-        #         print("WARNING: NaN values in observations!") 
-        observations = {"policy": obs}
+        
+        if self.use_history:
+            # Shift the history buffer (discard oldest, make room for newest)
+            self.obs_history = self.obs_history.roll(-1, dims=1)
+            
+            # Insert the current observation as the newest entry
+            self.obs_history[:, -1, :] = current_obs
+            
+            # Flatten the history for the policy
+            # Shape goes from [num_envs, history_length, single_obs_size] 
+            # to [num_envs, history_length * single_obs_size]
+            policy_obs = self.obs_history.reshape(self.num_envs, -1)
+            
+            # Optional: add observation normalization if needed
+            # policy_obs = torch.clamp(policy_obs, -10.0, 10.0)
+            
+            observations = {"policy": policy_obs}
+            print("Shape of observations using history:", observations["policy"].shape)
+            exit(0)
+        else:
+            # Just use the current observation if history is disabled
+            observations = {"policy": current_obs}
+            print("Shape of observations:", observations["policy"].shape)
+            exit(0)
         
         return observations
 
@@ -619,6 +624,31 @@ class SnakeEnv(DirectRLEnv):
         else:
             self.dof_targets = joint_pos
             self.prev_actions = joint_pos
+            
+        # Reset observation history for the reset environments
+        if self.use_history:
+            # Get the current observation for these environments
+            joint_pos_normalized = 2.0 * (joint_pos - self.joint_pos_lower_limits[env_ids]) / self.joint_pos_ranges[env_ids] - 1.0
+            root_pos = default_root_state[:, :3]
+            root_quat = default_root_state[:, 3:7]
+            root_lin_vel = torch.zeros_like(root_pos)  # Zero velocity on reset
+            
+            # Create the initial observation
+            initial_obs = torch.cat(
+                (
+                    joint_pos_normalized,   # Normalized joint positions
+                    joint_vel * 0.1,        # Scaled joint velocities (zeros)
+                    root_pos,               # Root position
+                    root_quat,              # Root orientation
+                    root_lin_vel,           # Root linear velocity (zeros)
+                ),
+                dim=-1,
+            )
+            
+            # Fill the entire history with the initial observation
+            if len(env_ids) > 0:  # Only if there are environments to reset
+                for t in range(self.history_length):
+                    self.obs_history[env_ids, t, :] = initial_obs
 
     # --- Override the step method ---
     def step(self, actions: torch.Tensor) -> tuple[dict, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
