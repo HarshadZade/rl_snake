@@ -61,5 +61,10 @@ _build
 # Pre-Trained Checkpoints
 /.pretrained_checkpoints/
 
+<<<<<<< HEAD
 # Teleop Recorded Dataset
 datasets
+=======
+# Misc.
+joint_tracking_plots/*
+>>>>>>> 94740dd9 (Add history to observations.)
