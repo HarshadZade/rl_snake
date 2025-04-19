@@ -30,9 +30,9 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     # env
     decimation = 2
     episode_length_s = 100.0
-    action_scale = 0.01  # rad #TODO: tune this
+    action_scale = 1.0  # rad/s - velocity control scale  #TODO: tune this
     action_space = 9    # 9 joints
-    observation_space = 28 #TODO: fix this
+    observation_space = 28
     state_space = 0
     link_length = 4.0  #TODO: Get this from the USD instead of hardcoding # Length of each link in meters, used for height termination
 
@@ -40,13 +40,13 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation)
 
     # scene
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=40.0, replicate_physics=True)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=64, env_spacing=40.0, replicate_physics=True)
 
     # -- Robot Configuration (Loading from USD)
     robot: ArticulationCfg = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot", # Standard prim path pattern
         spawn=sim_utils.UsdFileCfg(
-            usd_path="/home/hzade/temp/snake_2_link.usd",
+            usd_path="/home/hzade/temp/snake_velocity.usd",
             activate_contact_sensors=False, # Set to True if you need contact sensors #TODO: check this
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=False,
@@ -73,8 +73,8 @@ class SnakeEnvCfg(DirectRLEnvCfg):
                 joint_names_expr=["joint_1"], # Example regex
                 effort_limit=10000.0,   # <<< Tune based on your robot's specs
                 velocity_limit=10.0,  # <<< Tune based on your robot's specs
-                stiffness=100000.0,       # <<< Tune: Use >0 for position/velocity control
-                damping=500.0,        # <<< Tune: Use >0 for position/velocity control (helps stability)
+                stiffness=0.0,       # <<< Tune: Use >0 for position/velocity control
+                damping=100000.0,        # <<< Tune: Use >0 for position/velocity control (helps stability)
             ),
             # Add more actuator groups if joints have different properties
         },
@@ -104,21 +104,21 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     action_scale = 1.0  # rad/s - For velocity control, scale can be larger than position control
     
     # reward scales #TODO: check if this makes sense, get the correct ones.
-    rew_scale_forward_velocity = 100.0
-    rew_scale_action_penalty = -0.005 #-0.005
-    rew_scale_joint_vel_penalty = -0.001 #-0.001
-    rew_scale_termination = -0.05 #-2.0
+    rew_scale_forward_velocity = 1.0
+    # rew_scale_action_penalty = -0.005 #-0.005
+    rew_scale_joint_vel_penalty = -0.0001 #-0.001 - reduced penalty for velocity control
+    rew_scale_termination = 0.0 #-2.0
     rew_scale_alive = 0.1
-    rew_scale_action_smoothness_penalty = -0.05 #-0.05
-    rew_scale_lateral_velocity_penalty = -0.005 #-0.05
-    rew_scale_joint_limit_penalty = -0.1 #-0.1
+    rew_scale_action_smoothness_penalty = -0.01 #-0.05 - penalize jerky velocity commands
+    rew_scale_lateral_velocity_penalty = 0.0 #-0.05
+    rew_scale_joint_limit_penalty = 0.0 #-0.1
 
      # --- ADD TESTING CONFIGURATION ---
     @configclass
     class TestingCfg:
         """Configuration for testing modes."""
         # Set to True to override RL actions with manual oscillation
-        enable_manual_oscillation: bool = False
+        enable_manual_oscillation: bool = True
         # Oscillation amplitude in degrees (will be converted to radians)
         oscillation_amplitude_deg: float = 60.0
         # Oscillation frequency in Hertz
@@ -129,7 +129,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
 
     @configclass
     class PositionTrackingCfg:
-        """Configuration for position tracking analysis."""
+        """Configuration for velocity tracking analysis."""
         enable: bool = True
         env_id: int = 0     # Which environment to track
         joint_id: int = 0   # Which joint to track
@@ -165,19 +165,19 @@ class SnakeEnv(DirectRLEnv):
             self.tracking_joint_id = self.cfg.position_tracking.joint_id
             self.max_tracking_points = self.cfg.position_tracking.max_points
             
-            # Initialize position tracking data structure consistently
+            # Initialize velocity tracking data structure 
             self.position_tracking_data = {
                 "timesteps": [],
-                "commanded_positions": [],
-                "actual_positions": [],
+                "commanded_velocities": [],
+                "actual_velocities": [],
             }
-            print(f"[Info] Position tracking enabled for Env {self.tracking_env_id}, Joint {self.tracking_joint_id}.")
+            print(f"[Info] Velocity tracking enabled for Env {self.tracking_env_id}, Joint {self.tracking_joint_id}.")
             print(f"       Plots will be saved when you terminate the simulation (Ctrl+C).")
             
             # Set up signal handler for SIGINT (Ctrl+C)
             import signal
             def signal_handler(sig, frame):
-                print("\nCaught interrupt signal. Saving position tracking plot before exiting...")
+                print("\nCaught interrupt signal. Saving velocity tracking plot before exiting...")
                 self.save_position_tracking_plot()
                 print("Plot saved. Exiting...")
                 import sys
@@ -210,16 +210,15 @@ class SnakeEnv(DirectRLEnv):
         self.joint_pos_ranges = self.joint_pos_upper_limits - self.joint_pos_lower_limits + 1e-6
         self.joint_pos_mid = (self.joint_pos_lower_limits + self.joint_pos_upper_limits) / 2
 
-        # Initialize action history
-        # Start with default positions, cloned to avoid modifying the default tensor
-        self.dof_targets = self.snake_robot.data.default_joint_pos.clone().to(device=self.device)
-        self.prev_actions = torch.zeros((self.num_envs, self.cfg.action_space), device=self.device)
+        # Initialize velocity target buffers
+        self.joint_vel_targets = torch.zeros((self.num_envs, self.snake_robot.num_joints), device=self.device)
+        self.prev_actions = torch.zeros((self.num_envs, self.snake_robot.num_joints), device=self.device)
 
         # Cache common data tensors (optional)
         self.joint_pos = self.snake_robot.data.joint_pos
         self.joint_vel = self.snake_robot.data.joint_vel
         self.root_state = self.snake_robot.data.root_state_w
-    
+
     def _setup_scene(self):
         # Create snake robot articulation
         self.snake_robot = Articulation(self.cfg.robot)
@@ -245,8 +244,9 @@ class SnakeEnv(DirectRLEnv):
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self.env_step_counter += 1
         # Store action for smoothness calculations in reward
-        self.prev_actions = self.dof_targets.clone()
-         # Check if manual oscillation test mode is enabled
+        self.prev_actions = self.joint_vel_targets.clone()
+        
+        # Check if manual oscillation test mode is enabled
         if self.cfg.testing.enable_manual_oscillation:
             # --- MANUAL OSCILLATION LOGIC ---
             current_time = self.sim.current_time
@@ -256,87 +256,48 @@ class SnakeEnv(DirectRLEnv):
             # Calculate angular frequency
             omega = -2.0 * math.pi * self.cfg.testing.oscillation_frequency_hz
 
-            # Calculate the target angle based on a sine wave
-            # Target = Amplitude * sin(omega * time)
-            target_angle_rad = amplitude_rad * math.sin(omega * current_time)
-            if self.env_step_counter % 10 == 0: # Print every 10 steps
-                print(f"Step: {self.env_step_counter}, Time: {current_time:.4f}, Target Angle (rad): {target_angle_rad*180/math.pi:.4f}")
-            # Create a tensor with the target angle for all environments and joints
-            # Shape: (num_envs, num_joints) -> (4096, 1)
-            manual_targets = torch.full(
-                (self.num_envs, self.cfg.action_space),
-                target_angle_rad,
-                device=self.device,
-                dtype=torch.float32
-            )
+            # Create tensor of joint indices [0, 1, 2, ..., 8]
+            joint_indices = torch.arange(self.snake_robot.num_joints, device=self.device) # Shape (9,)
 
-            # Clamp the manually set targets to the joint limits (IMPORTANT!)
-            # Use the correctly shaped limits (num_envs, num_joints)
-            clamped_manual_targets = torch.clamp(
-                manual_targets,
-                self.joint_pos_lower_limits,
-                self.joint_pos_upper_limits
-            )
+            # Calculate phase offset for each joint: 0, pi, 2*pi, 3*pi, ...
+            # This makes adjacent joints 180 degrees out of phase
+            phase_offsets = joint_indices * math.pi # Shape (9,)
 
-            # Set the DOF targets directly
-            self.dof_targets[:] = clamped_manual_targets
+            # Calculate target velocity for each joint at this time step
+            # Using sine with phase offset and cosine for velocity (derivative of position)
+            # v(t) = Amp * w * cos(omega * t + phase_offset)
+            target_velocities_rad = amplitude_rad * omega * torch.cos(omega * current_time + phase_offsets) # Shape (9,)
 
-            # Optional: Set self.actions for potential use in reward calculations,
-            # although rewards might not be meaningful in this test mode.
-            # Setting to zeros or the scaled target might be reasonable.
-            self.actions = torch.zeros_like(actions) # Or some other placeholder
+            # Expand targets to all environments
+            # Shape: (1, 9) -> (num_envs, 9)
+            manual_targets = target_velocities_rad.unsqueeze(0).expand(self.num_envs, -1)
+
+            # Set the joint velocity targets directly
+            self.joint_vel_targets[:] = manual_targets
+
+            # --- Optional: Print targets for debugging ---
+            if self.env_step_counter % 20 == 0: # Print less often
+                # Print velocity targets for the first environment
+                print(f"Step: {self.env_step_counter}, Time: {current_time:.4f}, "
+                        f"Velocity Targets (rad/s): {self.joint_vel_targets[0].cpu().numpy().round(4)}")
+            # --- End Print ---
 
             # --- END MANUAL OSCILLATION LOGIC ---
 
         else:
-
-            # Process actions from the policy for POSITION CONTROL
+            # Process actions from the policy for VELOCITY CONTROL
             self.actions = actions.clone().clamp_(-1.0, 1.0)
 
-            # Calculate the desired change in target position
-            # Scale action by action_scale and time step
-            # The time step scaling makes the effect somewhat independent of simulation frequency
-            delta_targets = self.action_scale * self.actions * self.cfg.sim.dt * self.cfg.decimation
-
-            # Get current joint positions
-            current_joint_pos = self.snake_robot.data.joint_pos
-
-            # Calculate new targets by adding the delta to current positions
-            new_targets = current_joint_pos + delta_targets
+            # Scale normalized actions to velocity targets
+            # Map [-1, 1] to desired velocity range using action_scale
+            velocity_targets = self.action_scale * self.actions
             
-            self.dof_targets[:] = torch.clamp(new_targets, self.joint_pos_lower_limits, self.joint_pos_upper_limits)
+            # Set joint velocity targets directly - no need to accumulate like position
+            self.joint_vel_targets[:] = velocity_targets
 
-        # NOTE: Removed position tracking data collection from here - now done in step() method
-    
     def _apply_action(self) -> None:
         # Use velocity control instead of position control
         self.snake_robot.set_joint_velocity_target(self.joint_vel_targets)
-
-    def _get_single_observation_size(self):
-        """Calculate the size of a single observation (without history)."""
-        # Get joint positions and velocities
-        joint_pos = self.snake_robot.data.joint_pos
-        joint_vel = self.snake_robot.data.joint_vel
-        
-        # Calculate a single observation
-        single_obs = torch.cat(
-            (
-                # Normalized joint positions (shape: num_envs x 9)
-                torch.zeros_like(joint_pos),
-                # Scaled joint velocities (shape: num_envs x 9)
-                torch.zeros_like(joint_vel),
-                # Root position (shape: num_envs x 3)
-                torch.zeros((self.num_envs, 3), device=self.device),
-                # Root orientation (shape: num_envs x 4)
-                torch.zeros((self.num_envs, 4), device=self.device),
-                # Root linear velocity (shape: num_envs x 3)
-                torch.zeros((self.num_envs, 3), device=self.device),
-            ),
-            dim=-1,
-        )
-        
-        # Return the size of the last dimension (observation features)
-        return single_obs.shape[-1]
 
     def _get_single_observation_size(self):
         """Calculate the size of a single observation (without history)."""
@@ -404,23 +365,28 @@ class SnakeEnv(DirectRLEnv):
             # policy_obs = torch.clamp(policy_obs, -10.0, 10.0)
             
             observations = {"policy": policy_obs}
-            print("Shape of observations using history:", observations["policy"].shape)
-            exit(0)
         else:
             # Just use the current observation if history is disabled
             observations = {"policy": current_obs}
-            print("Shape of observations:", observations["policy"].shape)
-            exit(0)
         
         return observations
 
     def _get_rewards(self) -> torch.Tensor:
-        """
-        Calculate rewards using an LQR-like cost function for sidewinding.
-        Reward = state_tracking_reward - control_cost
-        """
-        # Get current state information
-        joint_pos = self.snake_robot.data.joint_pos
+        # Calculate forward velocity (x-direction for snake locomotion)
+        root_vel = self.snake_robot.data.root_lin_vel_w
+        forward_vel = root_vel[:, 0]  # X-component of velocity
+        
+        # Forward reward - primary objective is to move forward
+        forward_reward = self.cfg.rew_scale_forward_velocity * forward_vel
+        
+        # Sideways movement penalty - discourage excessive lateral motion
+        lateral_vel_penalty = self.cfg.rew_scale_lateral_velocity_penalty * torch.abs(root_vel[:, 1])
+        
+        # Action smoothness - penalize jerky changes in position targets
+        action_diff = self.joint_vel_targets - self.prev_actions
+        action_smoothness_penalty = self.cfg.rew_scale_action_smoothness_penalty * torch.sum(action_diff**2, dim=-1)
+        
+        # Energy consumption - penalize high joint velocities
         joint_vel = self.snake_robot.data.joint_vel
         
         # --- State tracking component ---
@@ -527,7 +493,7 @@ class SnakeEnv(DirectRLEnv):
         # up_world = quat_rotate(root_quat, up)
         # too_tilted = up_world[:, 2] < 0.0  # z component negative means flipped
         
-        # terminated = head_too_low | too_tilted
+        # # terminated = head_too_low | too_tilted
         self.joint_pos = self.snake_robot.data.joint_pos
         out_of_bounds = torch.any(self.joint_pos < self.joint_pos_lower_limits, dim=1) | \
                         torch.any(self.joint_pos > self.joint_pos_upper_limits, dim=1)
@@ -622,8 +588,8 @@ class SnakeEnv(DirectRLEnv):
             self.joint_vel_targets[env_ids] = joint_vel
             self.prev_actions[env_ids] = joint_vel
         else:
-            self.dof_targets = joint_pos
-            self.prev_actions = joint_pos
+            self.joint_vel_targets = joint_vel
+            self.prev_actions = joint_vel
             
         # Reset observation history for the reset environments
         if self.use_history:
@@ -654,32 +620,32 @@ class SnakeEnv(DirectRLEnv):
     def step(self, actions: torch.Tensor) -> tuple[dict, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """Override the main environment step to collect plotting data."""
 
-        # Before taking the step, record the current time and commanded position
+        # Before taking the step, record the current time and commanded velocity
         current_time = self.sim.current_time
-        commanded_position = None
+        commanded_velocity = None
         
         if self.track_positions and len(self.position_tracking_data["timesteps"]) < self.max_tracking_points:
-            commanded_position = self.dof_targets[self.tracking_env_id, self.tracking_joint_id].item()
+            commanded_velocity = self.joint_vel_targets[self.tracking_env_id, self.tracking_joint_id].item()
 
         # --- Call the original DirectRLEnv step logic ---
         # This handles: _pre_physics_step, sim.step(), _get_observations, _get_rewards, _get_dones, _reset_idx etc.
         obs_dict, rew, terminated, truncated, extras = super().step(actions)
         # --- End original step logic ---
 
-        # --- Collect BOTH commanded and actual position data AFTER physics step ---
-        if self.track_positions and commanded_position is not None:
-            # Get actual joint positions after the physics step
-            actual_pos = self.snake_robot.data.joint_pos[self.tracking_env_id, self.tracking_joint_id].item()
+        # --- Collect BOTH commanded and actual velocity data AFTER physics step ---
+        if self.track_positions and commanded_velocity is not None:
+            # Get actual joint velocities after the physics step
+            actual_vel = self.snake_robot.data.joint_vel[self.tracking_env_id, self.tracking_joint_id].item()
 
             # Debug: print collection info occasionally
             if self.env_step_counter % 100 == 0:
                 print(f"Collecting data point {len(self.position_tracking_data['timesteps'])} at time {self.sim.current_time:.2f}s")
-                print(f"  Commanded: {commanded_position:.4f}, Actual: {actual_pos:.4f}")
+                print(f"  Commanded velocity: {commanded_velocity:.4f}, Actual velocity: {actual_vel:.4f}")
             
             # Save both data points
             self.position_tracking_data["timesteps"].append(current_time)
-            self.position_tracking_data["commanded_positions"].append(commanded_position)
-            self.position_tracking_data["actual_positions"].append(actual_pos)
+            self.position_tracking_data["commanded_velocities"].append(commanded_velocity)
+            self.position_tracking_data["actual_velocities"].append(actual_vel)
 
             # No longer triggering plot saving periodically - will save on Ctrl+C via signal handler
 
@@ -688,12 +654,12 @@ class SnakeEnv(DirectRLEnv):
     
     def save_position_tracking_plot(self):
         print("#############################################")
-        print("Saving position tracking plot")
+        print("Saving velocity tracking plot")
         print("#############################################")
         
         # Save the tracking data to a file
         if not self.position_tracking_data["timesteps"]:
-            print("No position tracking data to plot!")
+            print("No velocity tracking data to plot!")
             return
             
         import numpy as np
@@ -703,8 +669,8 @@ class SnakeEnv(DirectRLEnv):
         
         # Debug info about data collection
         timesteps_count = len(self.position_tracking_data["timesteps"])
-        actual_count = len(self.position_tracking_data["actual_positions"])
-        cmd_count = len(self.position_tracking_data["commanded_positions"])
+        actual_count = len(self.position_tracking_data["actual_velocities"])
+        cmd_count = len(self.position_tracking_data["commanded_velocities"])
         
         print(f"Plotting data: timesteps={timesteps_count}, commanded={cmd_count}, actual={actual_count}")
         
@@ -715,29 +681,29 @@ class SnakeEnv(DirectRLEnv):
             # Adjust the arrays to the same length if needed
             min_len = min(timesteps_count, cmd_count, actual_count)
             self.position_tracking_data["timesteps"] = self.position_tracking_data["timesteps"][:min_len]
-            self.position_tracking_data["commanded_positions"] = self.position_tracking_data["commanded_positions"][:min_len]
-            self.position_tracking_data["actual_positions"] = self.position_tracking_data["actual_positions"][:min_len]
+            self.position_tracking_data["commanded_velocities"] = self.position_tracking_data["commanded_velocities"][:min_len]
+            self.position_tracking_data["actual_velocities"] = self.position_tracking_data["actual_velocities"][:min_len]
         
         # Create the plot
         plt.figure(figsize=(12, 6))
         times = np.array(self.position_tracking_data["timesteps"])
-        commanded = np.array(self.position_tracking_data["commanded_positions"])
-        actual = np.array(self.position_tracking_data["actual_positions"])
+        commanded = np.array(self.position_tracking_data["commanded_velocities"])
+        actual = np.array(self.position_tracking_data["actual_velocities"])
         
         # Only plot up to the length of the shortest array
         min_len = min(len(times), len(commanded), len(actual))
         print(f"Plotting {min_len} data points")
         
-        plt.plot(times[:min_len], commanded[:min_len], 'b-', label=f'Commanded Position (Joint {self.tracking_joint_id})')
-        plt.plot(times[:min_len], actual[:min_len], 'r-', label=f'Actual Position (Joint {self.tracking_joint_id})')
+        plt.plot(times[:min_len], commanded[:min_len], 'b-', label=f'Commanded Velocity (Joint {self.tracking_joint_id})')
+        plt.plot(times[:min_len], actual[:min_len], 'r-', label=f'Actual Velocity (Joint {self.tracking_joint_id})')
         
         plt.xlabel('Time (s)')
-        plt.ylabel('Joint Position (rad)')
-        plt.title(f'Joint Position Tracking - Env {self.tracking_env_id}, Joint {self.tracking_joint_id}')
+        plt.ylabel('Joint Velocity (rad/s)')
+        plt.title(f'Joint Velocity Tracking - Env {self.tracking_env_id}, Joint {self.tracking_joint_id}')
         plt.legend()
         plt.grid(True)
         
-        # Calculate position tracking error metrics
+        # Calculate velocity tracking error metrics
         if min_len > 0:
             error = commanded[:min_len] - actual[:min_len]
             rmse = np.sqrt(np.mean(np.square(error)))
@@ -745,7 +711,7 @@ class SnakeEnv(DirectRLEnv):
             avg_error = np.mean(np.abs(error))
             
             plt.figtext(0.02, 0.02, 
-                      f'RMSE: {rmse:.4f} rad\nMax Error: {max_error:.4f} rad\nAvg Error: {avg_error:.4f} rad',
+                      f'RMSE: {rmse:.4f} rad/s\nMax Error: {max_error:.4f} rad/s\nAvg Error: {avg_error:.4f} rad/s',
                       bbox={'facecolor': 'white', 'alpha': 0.8, 'pad': 5})
         
         # Create output directory if it doesn't exist
@@ -754,19 +720,19 @@ class SnakeEnv(DirectRLEnv):
         
         # Save the plot
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = os.path.join(output_dir, f'joint_tracking_env{self.tracking_env_id}_joint{self.tracking_joint_id}_{timestamp}.png')
+        filename = os.path.join(output_dir, f'joint_velocity_tracking_env{self.tracking_env_id}_joint{self.tracking_joint_id}_{timestamp}.png')
         plt.savefig(filename)
         plt.close()
         
         # Optional: Save the raw data as CSV
         data = np.column_stack((times[:min_len], commanded[:min_len], actual[:min_len]))
-        csv_filename = os.path.join(output_dir, f'joint_tracking_data_env{self.tracking_env_id}_joint{self.tracking_joint_id}_{timestamp}.csv')
+        csv_filename = os.path.join(output_dir, f'joint_velocity_tracking_data_env{self.tracking_env_id}_joint{self.tracking_joint_id}_{timestamp}.csv')
         np.savetxt(
             csv_filename,
             data,
             delimiter=',',
-            header='time,commanded_position,actual_position'
+            header='time,commanded_velocity,actual_velocity'
         )
         
-        print(f"Saved position tracking data and plot to {filename} at t={self.sim.current_time:.2f}s")
+        print(f"Saved velocity tracking data and plot to {filename} at t={self.sim.current_time:.2f}s")
         return filename

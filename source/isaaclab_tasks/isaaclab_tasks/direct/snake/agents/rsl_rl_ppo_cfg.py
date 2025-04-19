@@ -7,7 +7,7 @@ class SnakePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
     max_iterations = 1000
     save_interval = 50
-    experiment_name = "snake_direct-v1-w-history"
+    experiment_name = "snake_direct-v2-velocity"
     empirical_normalization = False
     
     # Neural network configuration
