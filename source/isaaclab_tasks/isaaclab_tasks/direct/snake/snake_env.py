@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import math
+import numpy as np
 import torch
 from collections.abc import Sequence
 
@@ -77,7 +78,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
             "snake_joints": ImplicitActuatorCfg(
                 # Use regex matching your joint names, or list them
                 joint_names_expr=["joint_[1-9]"], # Example regex
-                effort_limit=50000.0,   # <<< Tune based on your robot's specs
+                effort_limit=100000.0,   # <<< Tune based on your robot's specs
                 velocity_limit=10.0,  # <<< Tune based on your robot's specs
                 stiffness=0.0,       # <<< Tune: Use >0 for position/velocity control
                 damping=100000.0,        # <<< Tune: Use >0 for position/velocity control (helps stability)
@@ -125,10 +126,22 @@ class SnakeEnvCfg(DirectRLEnvCfg):
         """Configuration for testing modes."""
         # Set to True to override RL actions with manual oscillation
         enable_manual_oscillation: bool = True
-        # Oscillation amplitude in degrees (will be converted to radians)
-        oscillation_amplitude_deg: float = 30.0
-        # Oscillation frequency in Hertz
-        oscillation_frequency_hz: float = 1.0 # How many full cycles per second
+        
+        # --- Sidewinding parameters ---
+        # Amplitude in degrees (will be converted to radians)
+        amplitude_x_deg: float = 30.0  # Amplitude for even joints
+        amplitude_y_deg: float = 30.0  # Amplitude for odd joints
+        
+        # Angular frequency
+        omega_x: float = 5.0 * math.pi / 6.0  # Angular frequency for even joints
+        omega_y: float = 5.0 * math.pi / 6.0  # Angular frequency for odd joints
+        
+        # Phase offset per joint
+        delta_x: float = 2.0 * math.pi / 3.0  # Phase offset per even joint
+        delta_y: float = 2.0 * math.pi / 3.0  # Phase offset per odd joint
+        
+        # Phase difference between even and odd joints
+        phi: float = 0.0
 
     testing: TestingCfg = TestingCfg()
     # --- END TESTING CONFIGURATION ---
@@ -138,7 +151,8 @@ class SnakeEnvCfg(DirectRLEnvCfg):
         """Configuration for velocity tracking analysis."""
         enable: bool = True
         env_id: int = 0     # Which environment to track
-        joint_id: int = 0   # Which joint to track
+        track_all_joints: bool = True  # Whether to track all joints or just one
+        joint_id: int = 0   # Which joint to track (if not tracking all)
         max_points: int = 1000  # Maximum number of data points to collect
         save_interval_s: float = 10.0  # How often to save plots (seconds)
     
@@ -169,6 +183,7 @@ class SnakeEnv(DirectRLEnv):
         if self.track_positions:
             self.tracking_env_id = self.cfg.position_tracking.env_id
             self.tracking_joint_id = self.cfg.position_tracking.joint_id
+            self.track_all_joints = self.cfg.position_tracking.track_all_joints
             self.max_tracking_points = self.cfg.position_tracking.max_points
             
             # Initialize velocity tracking data structure 
@@ -177,7 +192,11 @@ class SnakeEnv(DirectRLEnv):
                 "commanded_velocities": [],
                 "actual_velocities": [],
             }
-            print(f"[Info] Velocity tracking enabled for Env {self.tracking_env_id}, Joint {self.tracking_joint_id}.")
+            
+            if self.track_all_joints:
+                print(f"[Info] Velocity tracking enabled for all joints in Env {self.tracking_env_id}.")
+            else:
+                print(f"[Info] Velocity tracking enabled for Env {self.tracking_env_id}, Joint {self.tracking_joint_id}.")
             print(f"       Plots will be saved when you terminate the simulation (Ctrl+C).")
             
             # Set up signal handler for SIGINT (Ctrl+C)
@@ -254,43 +273,65 @@ class SnakeEnv(DirectRLEnv):
         
         # Check if manual oscillation test mode is enabled
         if self.cfg.testing.enable_manual_oscillation:
-            # --- ALTERNATING SINE WAVE LOGIC ---
+            # --- SIDEWINDING MOTION PATTERN ---
             current_time = self.sim.current_time
 
             # Parameters from config
-            amplitude_rad = math.radians(self.cfg.testing.oscillation_amplitude_deg)
-            omega = 2.0 * math.pi * self.cfg.testing.oscillation_frequency_hz
-
-            # Create tensor of joint indices [0, 1, 2, ..., 8]
-            joint_indices = torch.arange(self.snake_robot.num_joints, device=self.device) # Shape (9,)
-
-            # Calculate phase offset for each joint: 0, pi, 2*pi, 3*pi, ...
-            # This makes adjacent joints 180 degrees out of phase
-            phase_offsets = joint_indices * math.pi # Shape (9,)
-
-            # Calculate target velocity for each joint at this time step
-            # Using sine with phase offset and cosine for velocity (derivative of position)
-            # v(t) = Amp * w * cos(omega * t + phase_offset)
-            target_velocities_rad = amplitude_rad * omega * torch.cos(omega * current_time + phase_offsets) # Shape (9,)
-
-            # Expand targets to all environments
-            # Shape: (1, 9) -> (num_envs, 9)
-            manual_targets = target_velocities_rad.unsqueeze(0).expand(self.num_envs, -1)
-
-            # Set the joint velocity targets directly
-            self.joint_vel_targets[:] = manual_targets
-
-            # --- Optional: Print targets for debugging ---
-            if self.env_step_counter % 20 == 0: # Print less often
-                # Print velocity targets for the first environment
-                print(f"Step: {self.env_step_counter}, Time: {current_time:.4f}, "
-                        f"Velocity Targets (rad/s): {self.joint_vel_targets[0].cpu().numpy().round(4)}")
-            # --- End Print ---
-
-            # Set self.actions for potential use in reward calculations (optional)
+            # Convert amplitude from degrees to radians
+            amplitude_x_rad = math.radians(self.cfg.testing.amplitude_x_deg)
+            amplitude_y_rad = math.radians(self.cfg.testing.amplitude_y_deg)
+            
+            # Angular frequencies
+            omega_x = self.cfg.testing.omega_x
+            omega_y = self.cfg.testing.omega_y
+            
+            # Phase offsets
+            delta_x = self.cfg.testing.delta_x
+            delta_y = self.cfg.testing.delta_y
+            
+            # Phase difference between patterns
+            phi = self.cfg.testing.phi
+            
+            # Number of joints
+            num_joints = self.snake_robot.num_joints
+            
+            # Create tensor to hold velocity targets
+            velocity_targets = torch.zeros((num_joints,), device=self.device)
+            
+            # Calculate velocity for each joint (derivative of position function)
+            for i in range(num_joints):
+                if i % 2 == 0:  # Even joints
+                    # velocity(n,t) = Ax * wx * cos(wx*t + n*deltax)
+                    velocity_targets[i] = amplitude_x_rad * omega_x * torch.cos(
+                        torch.tensor(omega_x * current_time + i * delta_x)
+                    )
+                else:  # Odd joints
+                    # velocity(n,t) = Ay * wy * cos(wy*t + n*deltay + phi)
+                    velocity_targets[i] = amplitude_y_rad * omega_y * torch.cos(
+                        torch.tensor(omega_y * current_time + i * delta_y + phi)
+                    )
+            
+            # Expand to all environments
+            self.joint_vel_targets[:] = velocity_targets.unsqueeze(0).expand(self.num_envs, -1)
+            
+            # Print debug info occasionally
+            if self.env_step_counter % 20 == 0:
+                print(f"Step: {self.env_step_counter}, Time: {current_time:.4f}")
+                print(f"Vel targets (first 3 joints, rad/s): {velocity_targets[:3].cpu().numpy().round(4)}")
+                
+                # Optional: Calculate and print expected positions (integral of velocity)
+                positions = []
+                for i in range(min(3, num_joints)):  # First 3 joints
+                    if i % 2 == 0:  # Even joints
+                        pos = amplitude_x_rad * torch.sin(torch.tensor(omega_x * current_time + i * delta_x))
+                    else:  # Odd joints
+                        pos = amplitude_y_rad * torch.sin(torch.tensor(omega_y * current_time + i * delta_y + phi))
+                    positions.append(pos.item())
+                print(f"Expected pos (first 3 joints, rad): {np.array(positions).round(4)}")
+                    
+            # Set self.actions for potential use in reward calculations
             self.actions = torch.zeros_like(actions)
-            # --- END ALTERNATING SINE WAVE LOGIC ---
-
+            
         else:
             # Process actions from the policy for VELOCITY CONTROL
             self.actions = actions.clone().clamp_(-1.0, 1.0)
@@ -391,17 +432,17 @@ class SnakeEnv(DirectRLEnv):
         
         # Action smoothness - penalize jerky changes in position targets
         action_diff = self.joint_vel_targets - self.prev_actions
-        action_smoothness_penalty = self.cfg.rew_scale_action_smoothness_penalty * torch.sum(action_diff**2, dim=-1)
+        action_smoothness_penalty = self.cfg.rew_scale_action_smoothness_penalty * torch.sum(action_diff**2, dim=1)
         
         # Energy consumption - penalize high joint velocities
         joint_vel = self.snake_robot.data.joint_vel
-        energy_penalty = self.cfg.rew_scale_joint_vel_penalty * torch.sum(joint_vel**2, dim=-1)
+        energy_penalty = self.cfg.rew_scale_joint_vel_penalty * torch.sum(joint_vel**2, dim=1)
         
         # Joint limit penalty - discourage operating at the limits
         normalized_joint_pos = (self.snake_robot.data.joint_pos - self.joint_pos_mid) / (self.joint_pos_ranges / 2)
         joint_limit_penalty = self.cfg.rew_scale_joint_limit_penalty * torch.sum(
             torch.maximum(torch.abs(normalized_joint_pos) - 0.8, torch.zeros_like(normalized_joint_pos))**2, 
-            dim=-1
+            dim=1
         )
         
         # Alive bonus - small constant reward for not terminating
@@ -471,7 +512,7 @@ class SnakeEnv(DirectRLEnv):
         # Option: Add a sinusoidal pattern as starting position
         # This can help the robot start with a sensible snake-like posture
         if True:
-            for i in range(self.cfg.action_space):
+            for i in range(self.snake_robot.num_joints):  # Fixed: use num_joints instead of action_space
                 # Phase offset to create a sinusoidal wave along the body
                 # Each joint is 90 degrees out of phase with the previous one
                 phase_offset = i * (math.pi / 2)
@@ -541,10 +582,15 @@ class SnakeEnv(DirectRLEnv):
 
         # Before taking the step, record the current time and commanded velocity
         current_time = self.sim.current_time
-        commanded_velocity = None
         
+        # Store commanded velocities before physics step if tracking is enabled
         if self.track_positions and len(self.position_tracking_data["timesteps"]) < self.max_tracking_points:
-            commanded_velocity = self.joint_vel_targets[self.tracking_env_id, self.tracking_joint_id].item()
+            if self.track_all_joints:
+                # Store commanded velocities for all joints in selected environment
+                commanded_velocities = self.joint_vel_targets[self.tracking_env_id].clone().cpu().numpy()
+            else:
+                # Store just the single joint's commanded velocity
+                commanded_velocities = self.joint_vel_targets[self.tracking_env_id, self.tracking_joint_id].item()
 
         # --- Call the original DirectRLEnv step logic ---
         # This handles: _pre_physics_step, sim.step(), _get_observations, _get_rewards, _get_dones, _reset_idx etc.
@@ -552,21 +598,27 @@ class SnakeEnv(DirectRLEnv):
         # --- End original step logic ---
 
         # --- Collect BOTH commanded and actual velocity data AFTER physics step ---
-        if self.track_positions and commanded_velocity is not None:
-            # Get actual joint velocities after the physics step
-            actual_vel = self.snake_robot.data.joint_vel[self.tracking_env_id, self.tracking_joint_id].item()
-
-            # Debug: print collection info occasionally
-            if self.env_step_counter % 100 == 0:
-                print(f"Collecting data point {len(self.position_tracking_data['timesteps'])} at time {self.sim.current_time:.2f}s")
-                print(f"  Commanded velocity: {commanded_velocity:.4f}, Actual velocity: {actual_vel:.4f}")
+        if self.track_positions and len(self.position_tracking_data["timesteps"]) < self.max_tracking_points:
+            if self.track_all_joints:
+                # Get actual joint velocities for all joints after the physics step
+                actual_velocities = self.snake_robot.data.joint_vel[self.tracking_env_id].clone().cpu().numpy()
+                
+                # Debug: print collection info occasionally
+                if self.env_step_counter % 100 == 0:
+                    print(f"Collecting data point {len(self.position_tracking_data['timesteps'])} at time {self.sim.current_time:.2f}s")
+            else:
+                # Get single joint's actual velocity after the physics step
+                actual_velocities = self.snake_robot.data.joint_vel[self.tracking_env_id, self.tracking_joint_id].item()
+                
+                # Debug: print collection info occasionally
+                if self.env_step_counter % 100 == 0:
+                    print(f"Collecting data point {len(self.position_tracking_data['timesteps'])} at time {self.sim.current_time:.2f}s")
+                    print(f"  Commanded velocity: {commanded_velocities:.4f}, Actual velocity: {actual_velocities:.4f}")
             
             # Save both data points
             self.position_tracking_data["timesteps"].append(current_time)
-            self.position_tracking_data["commanded_velocities"].append(commanded_velocity)
-            self.position_tracking_data["actual_velocities"].append(actual_vel)
-
-            # No longer triggering plot saving periodically - will save on Ctrl+C via signal handler
+            self.position_tracking_data["commanded_velocities"].append(commanded_velocities)
+            self.position_tracking_data["actual_velocities"].append(actual_velocities)
 
         return obs_dict, rew, terminated, truncated, extras
     # --- End override ---
@@ -581,77 +633,177 @@ class SnakeEnv(DirectRLEnv):
             print("No velocity tracking data to plot!")
             return
             
-        import numpy as np
         import matplotlib.pyplot as plt
         from datetime import datetime
         import os
-        
-        # Debug info about data collection
-        timesteps_count = len(self.position_tracking_data["timesteps"])
-        actual_count = len(self.position_tracking_data["actual_velocities"])
-        cmd_count = len(self.position_tracking_data["commanded_velocities"])
-        
-        print(f"Plotting data: timesteps={timesteps_count}, commanded={cmd_count}, actual={actual_count}")
-        
-        # Check if data lengths match
-        if timesteps_count != cmd_count or timesteps_count != actual_count:
-            print("WARNING: Data array lengths don't match!")
-            print(f"  timesteps: {timesteps_count}, commanded: {cmd_count}, actual: {actual_count}")
-            # Adjust the arrays to the same length if needed
-            min_len = min(timesteps_count, cmd_count, actual_count)
-            self.position_tracking_data["timesteps"] = self.position_tracking_data["timesteps"][:min_len]
-            self.position_tracking_data["commanded_velocities"] = self.position_tracking_data["commanded_velocities"][:min_len]
-            self.position_tracking_data["actual_velocities"] = self.position_tracking_data["actual_velocities"][:min_len]
-        
-        # Create the plot
-        plt.figure(figsize=(12, 6))
-        times = np.array(self.position_tracking_data["timesteps"])
-        commanded = np.array(self.position_tracking_data["commanded_velocities"])
-        actual = np.array(self.position_tracking_data["actual_velocities"])
-        
-        # Only plot up to the length of the shortest array
-        min_len = min(len(times), len(commanded), len(actual))
-        print(f"Plotting {min_len} data points")
-        
-        plt.plot(times[:min_len], commanded[:min_len], 'b-', label=f'Commanded Velocity (Joint {self.tracking_joint_id})')
-        plt.plot(times[:min_len], actual[:min_len], 'r-', label=f'Actual Velocity (Joint {self.tracking_joint_id})')
-        
-        plt.xlabel('Time (s)')
-        plt.ylabel('Joint Velocity (rad/s)')
-        plt.title(f'Joint Velocity Tracking - Env {self.tracking_env_id}, Joint {self.tracking_joint_id}')
-        plt.legend()
-        plt.grid(True)
-        
-        # Calculate velocity tracking error metrics
-        if min_len > 0:
-            error = commanded[:min_len] - actual[:min_len]
-            rmse = np.sqrt(np.mean(np.square(error)))
-            max_error = np.max(np.abs(error))
-            avg_error = np.mean(np.abs(error))
-            
-            plt.figtext(0.02, 0.02, 
-                      f'RMSE: {rmse:.4f} rad/s\nMax Error: {max_error:.4f} rad/s\nAvg Error: {avg_error:.4f} rad/s',
-                      bbox={'facecolor': 'white', 'alpha': 0.8, 'pad': 5})
         
         # Create output directory if it doesn't exist
         output_dir = os.path.join(os.getcwd(), "joint_tracking_plots")
         os.makedirs(output_dir, exist_ok=True)
         
-        # Save the plot
+        # Get timestamp for filenames
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = os.path.join(output_dir, f'joint_velocity_tracking_env{self.tracking_env_id}_joint{self.tracking_joint_id}_{timestamp}.png')
-        plt.savefig(filename)
-        plt.close()
         
-        # Optional: Save the raw data as CSV
-        data = np.column_stack((times[:min_len], commanded[:min_len], actual[:min_len]))
-        csv_filename = os.path.join(output_dir, f'joint_velocity_tracking_data_env{self.tracking_env_id}_joint{self.tracking_joint_id}_{timestamp}.csv')
-        np.savetxt(
-            csv_filename,
-            data,
-            delimiter=',',
-            header='time,commanded_velocity,actual_velocity'
-        )
+        # Get number of collected datapoints
+        timesteps_count = len(self.position_tracking_data["timesteps"])
         
-        print(f"Saved velocity tracking data and plot to {filename} at t={self.sim.current_time:.2f}s")
+        if self.track_all_joints:
+            # For multi-joint tracking
+            
+            # Convert data to numpy arrays for plotting
+            times = np.array(self.position_tracking_data["timesteps"])
+            
+            # Number of joints
+            num_joints = self.snake_robot.num_joints
+            
+            print(f"Plotting data: timesteps={timesteps_count}, joints={num_joints}")
+            
+            # Setup the plot - one figure with subplots for each joint
+            fig, axes = plt.subplots(num_joints, 1, figsize=(12, 3*num_joints), sharex=True)
+            
+            # Create arrays to store error metrics
+            rmse_values = np.zeros(num_joints)
+            max_error_values = np.zeros(num_joints)
+            avg_error_values = np.zeros(num_joints)
+            
+            # Extract data for each joint and plot
+            for joint_idx in range(num_joints):
+                # Extract data for this joint
+                commanded = np.array([cmd[joint_idx] for cmd in self.position_tracking_data["commanded_velocities"]])
+                actual = np.array([act[joint_idx] for act in self.position_tracking_data["actual_velocities"]])
+                
+                # Plot on the corresponding subplot
+                ax = axes[joint_idx]
+                ax.plot(times, commanded, 'b-', label='Commanded')
+                ax.plot(times, actual, 'r-', label='Actual')
+                
+                # Calculate error metrics for this joint
+                error = commanded - actual
+                rmse_values[joint_idx] = np.sqrt(np.mean(np.square(error)))
+                max_error_values[joint_idx] = np.max(np.abs(error))
+                avg_error_values[joint_idx] = np.mean(np.abs(error))
+                
+                # Add metrics to the plot
+                ax.text(0.02, 0.85, 
+                      f'RMSE: {rmse_values[joint_idx]:.4f} rad/s\nMax Err: {max_error_values[joint_idx]:.4f} rad/s\nAvg Err: {avg_error_values[joint_idx]:.4f} rad/s',
+                      transform=ax.transAxes,
+                      bbox={'facecolor': 'white', 'alpha': 0.8, 'pad': 5})
+                
+                # Add labels and legend
+                ax.set_ylabel(f'Joint {joint_idx} (rad/s)')
+                ax.set_title(f'Joint {joint_idx} Velocity Tracking')
+                ax.grid(True)
+                if joint_idx == 0:
+                    ax.legend(loc='upper right')
+            
+            # Common labels
+            axes[-1].set_xlabel('Time (s)')
+            fig.suptitle(f'Joint Velocity Tracking - All Joints in Env {self.tracking_env_id}')
+            plt.tight_layout()
+            
+            # Save the multi-joint plot
+            filename = os.path.join(output_dir, f'all_joints_velocity_tracking_env{self.tracking_env_id}_{timestamp}.png')
+            plt.savefig(filename)
+            plt.close()
+            
+            # Save a summary of the error metrics
+            summary_filename = os.path.join(output_dir, f'velocity_tracking_metrics_summary_{timestamp}.txt')
+            with open(summary_filename, 'w') as f:
+                f.write(f"Joint Velocity Tracking Metrics Summary - Env {self.tracking_env_id}\n")
+                f.write(f"Timestamp: {timestamp}\n\n")
+                f.write(f"{'Joint':<10}{'RMSE (rad/s)':<15}{'Max Error (rad/s)':<20}{'Avg Error (rad/s)':<20}\n")
+                f.write("-" * 65 + "\n")
+                for i in range(num_joints):
+                    f.write(f"{i:<10}{rmse_values[i]:<15.4f}{max_error_values[i]:<20.4f}{avg_error_values[i]:<20.4f}\n")
+                
+                # Add averages across all joints
+                f.write("-" * 65 + "\n")
+                f.write(f"{'Average':<10}{np.mean(rmse_values):<15.4f}{np.mean(max_error_values):<20.4f}{np.mean(avg_error_values):<20.4f}\n")
+            
+            # Optional: Save the raw data as CSV for all joints
+            # Create a header for the CSV file
+            header = 'time'
+            for i in range(num_joints):
+                header += f',cmd_vel_joint{i},act_vel_joint{i}'
+            
+            # Create the data array for CSV
+            csv_data = np.zeros((len(times), 1 + 2*num_joints))
+            csv_data[:, 0] = times
+            
+            for t in range(len(times)):
+                for j in range(num_joints):
+                    csv_data[t, 1 + 2*j] = self.position_tracking_data["commanded_velocities"][t][j]
+                    csv_data[t, 2 + 2*j] = self.position_tracking_data["actual_velocities"][t][j]
+            
+            csv_filename = os.path.join(output_dir, f'all_joints_velocity_tracking_data_env{self.tracking_env_id}_{timestamp}.csv')
+            np.savetxt(csv_filename, csv_data, delimiter=',', header=header)
+            
+            print(f"Saved multi-joint velocity tracking data and plot to {filename}")
+            print(f"Saved metrics summary to {summary_filename}")
+            print(f"Saved raw data to {csv_filename}")
+            
+        else:
+            # Single joint tracking (original code)
+            actual_count = len(self.position_tracking_data["actual_velocities"])
+            cmd_count = len(self.position_tracking_data["commanded_velocities"])
+            
+            print(f"Plotting data: timesteps={timesteps_count}, commanded={cmd_count}, actual={actual_count}")
+            
+            # Check if data lengths match
+            if timesteps_count != cmd_count or timesteps_count != actual_count:
+                print("WARNING: Data array lengths don't match!")
+                print(f"  timesteps: {timesteps_count}, commanded: {cmd_count}, actual: {actual_count}")
+                # Adjust the arrays to the same length if needed
+                min_len = min(timesteps_count, cmd_count, actual_count)
+                self.position_tracking_data["timesteps"] = self.position_tracking_data["timesteps"][:min_len]
+                self.position_tracking_data["commanded_velocities"] = self.position_tracking_data["commanded_velocities"][:min_len]
+                self.position_tracking_data["actual_velocities"] = self.position_tracking_data["actual_velocities"][:min_len]
+            
+            # Create the plot
+            plt.figure(figsize=(12, 6))
+            times = np.array(self.position_tracking_data["timesteps"])
+            commanded = np.array(self.position_tracking_data["commanded_velocities"])
+            actual = np.array(self.position_tracking_data["actual_velocities"])
+            
+            # Only plot up to the length of the shortest array
+            min_len = min(len(times), len(commanded), len(actual))
+            print(f"Plotting {min_len} data points")
+            
+            plt.plot(times[:min_len], commanded[:min_len], 'b-', label=f'Commanded Velocity (Joint {self.tracking_joint_id})')
+            plt.plot(times[:min_len], actual[:min_len], 'r-', label=f'Actual Velocity (Joint {self.tracking_joint_id})')
+            
+            plt.xlabel('Time (s)')
+            plt.ylabel('Joint Velocity (rad/s)')
+            plt.title(f'Joint Velocity Tracking - Env {self.tracking_env_id}, Joint {self.tracking_joint_id}')
+            plt.legend()
+            plt.grid(True)
+            
+            # Calculate velocity tracking error metrics
+            if min_len > 0:
+                error = commanded[:min_len] - actual[:min_len]
+                rmse = np.sqrt(np.mean(np.square(error)))
+                max_error = np.max(np.abs(error))
+                avg_error = np.mean(np.abs(error))
+                
+                plt.figtext(0.02, 0.02, 
+                          f'RMSE: {rmse:.4f} rad/s\nMax Error: {max_error:.4f} rad/s\nAvg Error: {avg_error:.4f} rad/s',
+                          bbox={'facecolor': 'white', 'alpha': 0.8, 'pad': 5})
+            
+            # Save the plot
+            filename = os.path.join(output_dir, f'joint_velocity_tracking_env{self.tracking_env_id}_joint{self.tracking_joint_id}_{timestamp}.png')
+            plt.savefig(filename)
+            plt.close()
+            
+            # Optional: Save the raw data as CSV
+            data = np.column_stack((times[:min_len], commanded[:min_len], actual[:min_len]))
+            csv_filename = os.path.join(output_dir, f'joint_velocity_tracking_data_env{self.tracking_env_id}_joint{self.tracking_joint_id}_{timestamp}.csv')
+            np.savetxt(
+                csv_filename,
+                data,
+                delimiter=',',
+                header='time,commanded_velocity,actual_velocity'
+            )
+            
+            print(f"Saved velocity tracking data and plot to {filename} at t={self.sim.current_time:.2f}s")
+        
         return filename
