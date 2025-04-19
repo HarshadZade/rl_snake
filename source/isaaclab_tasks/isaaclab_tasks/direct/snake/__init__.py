@@ -7,7 +7,7 @@ from . import agents
 ##
 
 gym.register(
-    id="Isaac-Snake-Direct-v1-w-history",
+    id="Isaac-Snake-Direct-v2-velocity",
     entry_point=f"{__name__}.snake_env:SnakeEnv",
     disable_env_checker=True,
     kwargs={
