@@ -110,23 +110,20 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     # Action scale now determines how much the target velocity changes per RL step
     action_scale = 1.0  # rad/s - For velocity control, scale can be larger than position control
     
-    # reward scales #TODO: check if this makes sense, get the correct ones.
-    rew_scale_forward_velocity = 0.5  # Reduced importance of just forward velocity
-    # rew_scale_action_penalty = -0.005 #-0.005
-    rew_scale_joint_vel_penalty = -0.0001 #-0.001 - reduced penalty for velocity control
-    rew_scale_termination = 0.0 #-2.0
-    rew_scale_alive = 0.1
-    rew_scale_action_smoothness_penalty = 0.0 #-0.01 #-0.05 - penalize jerky velocity commands
-    rew_scale_lateral_velocity_penalty = 0.0 #-0.05  # Changed from 0.0 to negative to penalize only excessive lateral movement
-    rew_scale_joint_limit_penalty = -0.1 #-0.1  # Increased from 0.0 to discourage joint limits
+    # reward scales 
+    rew_scale_forward_velocity = 0.0  # Not using this in LQR approach
+    rew_scale_joint_vel_penalty = -0.0001  # Small penalty on joint velocities (control cost)
+    rew_scale_termination = 0.0
+    rew_scale_alive = 0.1  # Small alive bonus
+    rew_scale_action_smoothness_penalty = 0.0
+    rew_scale_lateral_velocity_penalty = 0.0
+    rew_scale_joint_limit_penalty = -0.1  # Keep joint limit penalty
     
-    # New reward parameters for sidewinding
-    rew_scale_sidewinding = 1.0  # Reward for proper sidewinding motion
-    rew_scale_phase_coordination = 0.0 #0.5  # Reward for proper phase relationships between joints
-    rew_scale_vertical_motion = 0.00 #-0.01  # Penalty for excessive vertical motion (should stay close to ground)
-    rew_scale_joint_pattern = 0.0 #0.4  # Reward for proper alternating joint patterns
-
-     # --- ADD TESTING CONFIGURATION ---
+    # LQR reward parameters
+    rew_scale_state_tracking = 1.0  # Weight for state tracking term
+    rew_scale_control_cost = -0.001  # Weight for control cost term
+    
+    # --- ADD TESTING CONFIGURATION ---
     @configclass
     class TestingCfg:
         """Configuration for testing modes."""
@@ -184,6 +181,9 @@ class SnakeEnv(DirectRLEnv):
         self.env_step_counter = 0
         #TODO: Need to make sure all the required information is used and set here!!
         # Currently its just some random stuff!
+        
+        # Add target link for velocity tracking (link 5 for middle of the snake)
+        self.target_link_idx = 5  # Using link 5 for velocity tracking
         
         self.track_positions = self.cfg.position_tracking.enable # Use the flag from config
         if self.track_positions:
@@ -426,103 +426,67 @@ class SnakeEnv(DirectRLEnv):
         return observations
 
     def _get_rewards(self) -> torch.Tensor:
-        # Calculate forward velocity (x-direction for locomotion)
-        root_vel = self.snake_robot.data.root_lin_vel_w
-        forward_vel = root_vel[:, 0]  # X-component of velocity
-        lateral_vel = root_vel[:, 1]  # Y-component of velocity
-        vertical_vel = root_vel[:, 2]  # Z-component of velocity
-        
-        # Get joint positions and velocities for pattern analysis
+        """
+        Calculate rewards using an LQR-like cost function for sidewinding.
+        Reward = state_tracking_reward - control_cost
+        """
+        # Get current state information
         joint_pos = self.snake_robot.data.joint_pos
         joint_vel = self.snake_robot.data.joint_vel
         
-        # 1. Forward reward - still important but less emphasized
-        forward_reward = self.cfg.rew_scale_forward_velocity * forward_vel
+        # --- State tracking component ---
+        # For sidewinding, we want to track:
+        # 1. Forward velocity (x-direction)
+        # 2. Lateral velocity (y-direction) - important for sidewinding
         
-        # 2. Sidewinding reward - combination of forward progress with lateral motion
-        # For sidewinding, we want some lateral velocity, but coordinated with forward velocity
-        lateral_movement = torch.abs(lateral_vel)
-        sidewinding_quality = torch.min(forward_vel, lateral_movement)  # Reward balanced motion
-        sidewinding_reward = self.cfg.rew_scale_sidewinding * sidewinding_quality
+        # Get the velocity of link 5 instead of the root
+        # Get link velocities - contains [linear_vel, angular_vel] for each link
+        link_velocities = self.snake_robot.data.body_vel_w  # Shape: [num_envs, num_links, 6]
         
-        # 3. Phase coordination - reward proper phase relationships between joints
-        # For odd-even joint coordination (characteristic of sidewinding)
-        odd_joints = joint_pos[:, 1::2]  # Odd-indexed joints
-        even_joints = joint_pos[:, 0::2]  # Even-indexed joints
+        # The first 3 components are linear velocity [vx, vy, vz]
+        link_vel = link_velocities[:, self.target_link_idx, :3]  # Extract linear velocity of link 5
         
-        # Calculate average offset between odd and even joints (should be ~90° for sidewinding)
-        # Use absolute value since phase can be positive or negative
-        # We're looking for joints that are approximately 90 degrees (π/2) out of phase
-        target_phase_diff = math.pi / 2
+        # Target velocities for sidewinding (forward + lateral movement)
+        target_forward_vel = torch.ones((self.num_envs,), device=self.device)  # Target forward velocity of 1 m/s
+        target_lateral_vel = torch.ones((self.num_envs,), device=self.device)  # Target lateral velocity of 1 m/s (for sidewinding)
         
-        # Calculate a rough phase difference metric based on positions
-        odd_mean = torch.mean(torch.sin(odd_joints), dim=1)
-        even_mean = torch.mean(torch.sin(even_joints), dim=1)
-        phase_diff = torch.abs(torch.atan2(odd_mean, even_mean))
+        # Current velocities from link 5
+        current_forward_vel = link_vel[:, 0]  # X-component of link 5 velocity
+        current_lateral_vel = link_vel[:, 1]  # Y-component of link 5 velocity
         
-        # Reward being close to the target phase difference
-        phase_reward = self.cfg.rew_scale_phase_coordination * (1.0 - torch.abs(phase_diff - target_phase_diff) / target_phase_diff)
+        # Calculate state tracking error (quadratic cost on deviation from target)
+        forward_vel_error = (current_forward_vel - target_forward_vel) ** 2
+        lateral_vel_error = (current_lateral_vel - target_lateral_vel) ** 2
         
-        # 4. Pattern reward - check for alternating joint movements (snake wave pattern)
-        # A sidewinding snake should have alternating joint movement directions
-        joint_direction = torch.sign(joint_vel)
-        # Calculate how many adjacent joints are moving in opposite directions
-        adjacent_opposite = torch.sum(
-            torch.abs(joint_direction[:, :-1] - joint_direction[:, 1:]) / 2.0, 
-            dim=1
-        ) / (joint_direction.shape[1] - 1)  # Normalize by number of joint pairs
-        pattern_reward = self.cfg.rew_scale_joint_pattern * adjacent_opposite
+        # Combined state tracking error
+        state_tracking_error = forward_vel_error + lateral_vel_error
+        state_tracking_reward = self.cfg.rew_scale_state_tracking * torch.exp(-state_tracking_error)
         
-        # 5. Vertical motion penalty - sidewinding should stay close to ground
-        vertical_penalty = self.cfg.rew_scale_vertical_motion * torch.abs(vertical_vel)
+        # --- Control cost component ---
+        # Penalize control effort (joint velocities)
+        control_cost = self.cfg.rew_scale_control_cost * torch.sum(joint_vel**2, dim=1)
         
-        # 6. Lateral motion penalty - modified to only penalize excessive lateral motion
-        # (some lateral motion is good for sidewinding)
-        excess_lateral = torch.maximum(lateral_movement - 1.5 * forward_vel, torch.zeros_like(lateral_movement))
-        lateral_vel_penalty = self.cfg.rew_scale_lateral_velocity_penalty * excess_lateral
-        
-        # 7. Action smoothness - penalize jerky changes in velocity targets
-        action_diff = self.joint_vel_targets - self.prev_actions
-        action_smoothness_penalty = self.cfg.rew_scale_action_smoothness_penalty * torch.sum(action_diff**2, dim=1)
-        
-        # 8. Energy consumption - penalize high joint velocities
-        energy_penalty = self.cfg.rew_scale_joint_vel_penalty * torch.sum(joint_vel**2, dim=1)
-        
-        # 9. Joint limit penalty - discourage operating at the limits
+        # --- Joint limit penalty (safety constraint) ---
         normalized_joint_pos = (joint_pos - self.joint_pos_mid) / (self.joint_pos_ranges / 2)
         joint_limit_penalty = self.cfg.rew_scale_joint_limit_penalty * torch.sum(
             torch.maximum(torch.abs(normalized_joint_pos) - 0.8, torch.zeros_like(normalized_joint_pos))**2, 
             dim=1
         )
         
-        # 10. Alive bonus - small constant reward for not terminating
+        # --- Alive bonus ---
         alive_bonus = self.cfg.rew_scale_alive
         
-        # Calculate total reward
-        total_reward = (
-            forward_reward + 
-            sidewinding_reward +
-            phase_reward +
-            pattern_reward +
-            vertical_penalty +
-            lateral_vel_penalty + 
-            action_smoothness_penalty + 
-            energy_penalty + 
-            joint_limit_penalty + 
-            alive_bonus
-        )
+        # Total reward
+        total_reward = state_tracking_reward + control_cost + joint_limit_penalty + alive_bonus
         
-        # For debugging, store reward components
+        # Log components for debugging
         self.extras["log"] = {
-            "forward_reward": forward_reward.mean().item(),
-            "sidewinding_reward": sidewinding_reward.mean().item(),
-            "phase_reward": phase_reward.mean().item(),
-            "pattern_reward": pattern_reward.mean().item(),
-            "vertical_penalty": vertical_penalty.mean().item(),
-            "lateral_vel_penalty": lateral_vel_penalty.mean().item(),
-            "action_smoothness_penalty": action_smoothness_penalty.mean().item(),
-            "energy_penalty": energy_penalty.mean().item(),
+            "state_tracking_reward": state_tracking_reward.mean().item(),
+            "link5_forward_vel": current_forward_vel.mean().item(),
+            "link5_lateral_vel": current_lateral_vel.mean().item(),
+            "control_cost": control_cost.mean().item(),
             "joint_limit_penalty": joint_limit_penalty.mean().item(),
+            "alive_bonus": alive_bonus,
             "total_reward": total_reward.mean().item(),
         }
         
