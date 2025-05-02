@@ -34,6 +34,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     action_space = 9    # 9 joints
     observation_space = 28
     state_space = 0
+    link_length = 4.0  #TODO: Get this from the USD instead of hardcoding # Length of each link in meters, used for height termination
 
     # simulation
     sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation)
@@ -114,13 +115,13 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     rew_scale_forward_velocity = 0.0  # Not using this in LQR approach
     rew_scale_joint_vel_penalty = -0.0001  # Small penalty on joint velocities (control cost)
     rew_scale_termination = 0.0
-    rew_scale_alive = 0.1  # Small alive bonus
+    rew_scale_alive = 1.0  # Small alive bonus
     rew_scale_action_smoothness_penalty = 0.0
     rew_scale_lateral_velocity_penalty = 0.0
-    rew_scale_joint_limit_penalty = -0.1  # Keep joint limit penalty
+    rew_scale_joint_limit_penalty = -5.0  # Keep joint limit penalty
     
     # LQR reward parameters
-    rew_scale_state_tracking = 1.0  # Weight for state tracking term
+    rew_scale_state_tracking = 10.0  # Weight for state tracking term
     rew_scale_control_cost = -0.001  # Weight for control cost term
     
     # --- ADD TESTING CONFIGURATION ---
@@ -182,8 +183,8 @@ class SnakeEnv(DirectRLEnv):
         #TODO: Need to make sure all the required information is used and set here!!
         # Currently its just some random stuff!
         
-        # Add target link for velocity tracking (link 5 for middle of the snake)
-        self.target_link_idx = 5  # Using link 5 for velocity tracking
+        # Define which links to track for velocity
+        self.tracked_link_indices = torch.tensor([1, 5, 10], device=self.device)
         
         self.track_positions = self.cfg.position_tracking.enable # Use the flag from config
         if self.track_positions:
@@ -237,7 +238,6 @@ class SnakeEnv(DirectRLEnv):
         self.joint_pos_limits = self.snake_robot.data.soft_joint_pos_limits
         self.joint_pos_lower_limits = self.joint_pos_limits[..., 0].to(self.device) # Ellipsis (...) means all preceding dims
         self.joint_pos_upper_limits = self.joint_pos_limits[..., 1].to(self.device)
-        
         self.joint_pos_ranges = self.joint_pos_upper_limits - self.joint_pos_lower_limits + 1e-6
         self.joint_pos_mid = (self.joint_pos_lower_limits + self.joint_pos_upper_limits) / 2
 
@@ -439,28 +439,42 @@ class SnakeEnv(DirectRLEnv):
         # 1. Forward velocity (x-direction)
         # 2. Lateral velocity (y-direction) - important for sidewinding
         
-        # Get the velocity of link 5 instead of the root
-        # Get link velocities - contains [linear_vel, angular_vel] for each link
+        # Get velocities for all links
         link_velocities = self.snake_robot.data.body_vel_w  # Shape: [num_envs, num_links, 6]
         
         # The first 3 components are linear velocity [vx, vy, vz]
-        link_vel = link_velocities[:, self.target_link_idx, :3]  # Extract linear velocity of link 5
+        link_linear_vels = link_velocities[:, :, :3]  # Extract linear velocities for all links
         
         # Target velocities for sidewinding (forward + lateral movement)
-        target_forward_vel = torch.ones((self.num_envs,), device=self.device)  # Target forward velocity of 1 m/s
+        target_forward_vel = torch.ones((self.num_envs,), device=self.device) * 0.5  # Target forward velocity of 0.5 m/s
         target_lateral_vel = torch.ones((self.num_envs,), device=self.device)  # Target lateral velocity of 1 m/s (for sidewinding)
         
-        # Current velocities from link 5
-        current_forward_vel = link_vel[:, 0]  # X-component of link 5 velocity
-        current_lateral_vel = link_vel[:, 1]  # Y-component of link 5 velocity
+        # Extract only the tracked links' velocities
+        # First ensure the tracked indices are within range
+        num_links = link_linear_vels.shape[1]
+        valid_indices = self.tracked_link_indices[self.tracked_link_indices < num_links]
         
-        # Calculate state tracking error (quadratic cost on deviation from target)
-        forward_vel_error = (current_forward_vel - target_forward_vel) ** 2
-        lateral_vel_error = (current_lateral_vel - target_lateral_vel) ** 2
+        # If no valid indices (unlikely), use the first link as fallback
+        if len(valid_indices) == 0:
+            valid_indices = torch.tensor([0], device=self.device)
+            
+        # Extract tracked link velocities
+        tracked_links_forward_vel = link_linear_vels[:, valid_indices, 0]  # [num_envs, num_tracked_links]
+        tracked_links_lateral_vel = link_linear_vels[:, valid_indices, 1]  # [num_envs, num_tracked_links]
         
-        # Combined state tracking error
-        state_tracking_error = forward_vel_error + lateral_vel_error
-        state_tracking_reward = self.cfg.rew_scale_state_tracking * torch.exp(-state_tracking_error)
+        # Calculate squared error for tracked links compared to target (broadcasting the target)
+        forward_vel_errors = (tracked_links_forward_vel - target_forward_vel.unsqueeze(1)) ** 2  # [num_envs, num_tracked_links]
+        lateral_vel_errors = (tracked_links_lateral_vel - target_lateral_vel.unsqueeze(1)) ** 2  # [num_envs, num_tracked_links]
+        
+        # Combined error for tracked links
+        combined_vel_errors = forward_vel_errors + lateral_vel_errors  # [num_envs, num_tracked_links]
+        # combined_vel_errors = lateral_vel_errors  # [num_envs, num_links]
+        
+        # Average error across tracked links for each environment
+        mean_vel_error = torch.mean(combined_vel_errors, dim=1)  # [num_envs]
+        
+        # Convert to reward using exponential (higher when error is lower)
+        state_tracking_reward = self.cfg.rew_scale_state_tracking * torch.exp(-mean_vel_error)
         
         # --- Control cost component ---
         # Penalize control effort (joint velocities)
@@ -469,7 +483,7 @@ class SnakeEnv(DirectRLEnv):
         # --- Joint limit penalty (safety constraint) ---
         normalized_joint_pos = (joint_pos - self.joint_pos_mid) / (self.joint_pos_ranges / 2)
         joint_limit_penalty = self.cfg.rew_scale_joint_limit_penalty * torch.sum(
-            torch.maximum(torch.abs(normalized_joint_pos) - 0.8, torch.zeros_like(normalized_joint_pos))**2, 
+            torch.maximum(torch.abs(normalized_joint_pos) - 0.5, torch.zeros_like(normalized_joint_pos))**2, 
             dim=1
         )
         
@@ -480,14 +494,25 @@ class SnakeEnv(DirectRLEnv):
         total_reward = state_tracking_reward + control_cost + joint_limit_penalty + alive_bonus
         
         # Log components for debugging
+        # For logging, extract mean velocities of the tracked links
+        avg_forward_vel = torch.mean(tracked_links_forward_vel, dim=1).mean().item()
+        avg_lateral_vel = torch.mean(tracked_links_lateral_vel, dim=1).mean().item()
+        
+        # Also log per-link velocities for debugging
+        tracked_vels = {}
+        for i, link_idx in enumerate(valid_indices.cpu().numpy()):
+            tracked_vels[f"link{link_idx}_forward_vel"] = tracked_links_forward_vel[:, i].mean().item()
+            tracked_vels[f"link{link_idx}_lateral_vel"] = tracked_links_lateral_vel[:, i].mean().item()
+        
         self.extras["log"] = {
             "state_tracking_reward": state_tracking_reward.mean().item(),
-            "link5_forward_vel": current_forward_vel.mean().item(),
-            "link5_lateral_vel": current_lateral_vel.mean().item(),
+            "avg_tracked_links_forward_vel": avg_forward_vel,
+            "avg_tracked_links_lateral_vel": avg_lateral_vel,
             "control_cost": control_cost.mean().item(),
             "joint_limit_penalty": joint_limit_penalty.mean().item(),
             "alive_bonus": alive_bonus,
             "total_reward": total_reward.mean().item(),
+            **tracked_vels  # Add per-link velocity info
         }
         
         return total_reward
@@ -514,11 +539,46 @@ class SnakeEnv(DirectRLEnv):
         # too_tilted = up_world[:, 2] < 0.0  # z component negative means flipped
         
         # # terminated = head_too_low | too_tilted
-        self.joint_pos = self.snake_robot.data.joint_pos
-        out_of_bounds = torch.any(self.joint_pos < self.joint_pos_lower_limits, dim=1) | \
-                        torch.any(self.joint_pos > self.joint_pos_upper_limits, dim=1)
         
-        return out_of_bounds, time_out
+        # Get joint position bounds check
+        self.joint_pos = self.snake_robot.data.joint_pos
+        out_of_bounds = torch.any(self.joint_pos < self.joint_pos_lower_limits + 0.524, dim=1) | \
+                        torch.any(self.joint_pos > self.joint_pos_upper_limits - 0.524, dim=1) #1.57-0.524 rad = 60 deg. restricting the max angles 
+        
+        # Get body position world coordinates
+        body_pos_w = self.snake_robot.data.body_pos_w  # Shape: [num_envs, num_links, 3]
+        
+        # Check if any link's height (z-coordinate) exceeds the link length
+        # The 3rd component (index 2) of the position vector is the z coordinate (height)
+        link_heights = body_pos_w[:, :, 2]  # Extract heights for all links
+        too_high = torch.any(link_heights > self.cfg.link_length, dim=1)
+        
+        # Combine all termination conditions
+        # terminated = out_of_bounds | too_high
+        
+        terminated = out_of_bounds 
+        
+        # Add logging information for debugging
+        if self.env_step_counter % 100 == 0:  # Only log occasionally to avoid overhead
+            num_too_high = torch.sum(too_high).item()
+            if num_too_high > 0:
+                print(f"[Step {self.env_step_counter}] Terminating {num_too_high} environments due to links being too high")
+                
+                # For the first environment with high links, log details about which links are too high
+                if too_high[0]:
+                    first_env_heights = link_heights[0]
+                    high_links = (first_env_heights > self.cfg.link_length).nonzero().flatten()
+                    high_link_heights = first_env_heights[high_links]
+                    print(f"  Env 0: Links {high_links.cpu().numpy()} are too high with heights {high_link_heights.cpu().numpy()}")
+        
+        # Add termination reason info to extras
+        if "episode" not in self.extras:
+            self.extras["episode"] = {}
+        
+        self.extras["episode"]["terminations/joint_out_of_bounds"] = torch.sum(out_of_bounds).item()
+        self.extras["episode"]["terminations/link_too_high"] = torch.sum(too_high).item()
+        
+        return terminated, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         if env_ids is None:
