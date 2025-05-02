@@ -5,9 +5,9 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 @configclass
 class SnakePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
-    max_iterations = 5000
+    max_iterations = 10000
     save_interval = 50
-    experiment_name = "snake_direct-v2-velocity"
+    experiment_name = "snake_direct-v3_cmd-l-1-5-10"
     empirical_normalization = False
     
     # Neural network configuration
@@ -23,10 +23,10 @@ class SnakePPORunnerCfg(RslRlOnPolicyRunnerCfg):
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.0,
+        entropy_coef=0.1,
         num_learning_epochs=5,
         num_mini_batches=4,
-        learning_rate=5.0e-5,  # Slightly lower learning rate for stability
+        learning_rate=3.0e-4,  # Slightly lower learning rate for stability
         schedule="adaptive",
         gamma=0.99,
         lam=0.95,
