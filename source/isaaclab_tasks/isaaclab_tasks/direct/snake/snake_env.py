@@ -129,7 +129,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     class TestingCfg:
         """Configuration for testing modes."""
         # Set to True to override RL actions with manual oscillation
-        enable_manual_oscillation: bool = False
+        enable_manual_oscillation: bool = True
         
         # --- Sidewinding parameters ---
         # Amplitude in degrees (will be converted to radians)
@@ -153,7 +153,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     @configclass
     class PositionTrackingCfg:
         """Configuration for velocity tracking analysis."""
-        enable: bool = True
+        enable: bool = False
         env_id: int = 0     # Which environment to track
         track_all_joints: bool = True  # Whether to track all joints or just one
         joint_id: int = 0   # Which joint to track (if not tracking all)
@@ -171,6 +171,19 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     
     observation_history: ObservationHistoryCfg = ObservationHistoryCfg()
     # --- END OBSERVATION HISTORY CONFIGURATION ---
+    
+    # --- ADD OBSERVATION VISUALIZATION CONFIG ---
+    @configclass
+    class ObservationVisualizationCfg:
+        """Configuration for observation visualization."""
+        enable: bool = True
+        env_id: int = 0  # Which environment to visualize
+        max_points: int = 1000  # Maximum number of data points to collect
+        save_interval_s: float = 10.0  # How often to save plots (seconds)
+        components_to_plot: list = ["joint_pos", "joint_vel", "root_pos", "root_lin_vel"]  # Which components to plot
+    
+    observation_visualization: ObservationVisualizationCfg = ObservationVisualizationCfg()
+    # --- END OBSERVATION VISUALIZATION CONFIG ---
 
 class SnakeEnv(DirectRLEnv):
     cfg: SnakeEnvCfg
@@ -234,6 +247,48 @@ class SnakeEnv(DirectRLEnv):
                 device=self.device
             )
         # --- End observation history initialization ---
+        
+        # --- Initialize observation visualization ---
+        self.visualize_observations = self.cfg.observation_visualization.enable
+        if self.visualize_observations:
+            self.visualization_env_id = self.cfg.observation_visualization.env_id
+            self.max_visualization_points = self.cfg.observation_visualization.max_points
+            self.components_to_plot = self.cfg.observation_visualization.components_to_plot
+            
+            # Initialize data structure for observation visualization
+            self.observation_viz_data = {
+                "timesteps": [],
+                "joint_pos": [],
+                "joint_vel": [],
+                "root_pos": [],
+                "root_quat": [],
+                "root_lin_vel": [],
+                "flattened_policy_obs": [],  # Store the flattened policy observation for verification
+            }
+            
+            print(f"[Info] Observation visualization enabled for Env {self.visualization_env_id}.")
+            print(f"       Components being tracked: {self.components_to_plot}")
+            print(f"       Plots will be saved when you terminate the simulation (Ctrl+C).")
+            
+            # Extend the signal handler to also save observation plots
+            import signal
+            original_sigint_handler = signal.getsignal(signal.SIGINT)
+            
+            def extended_signal_handler(sig, frame):
+                print("\nCaught interrupt signal. Saving observation visualization plots before exiting...")
+                self.save_observation_plots()
+                
+                # Call the original handler if it exists
+                if callable(original_sigint_handler):
+                    original_sigint_handler(sig, frame)
+                else:
+                    print("Exiting...")
+                    import sys
+                    sys.exit(0)
+            
+            # Register the extended signal handler
+            signal.signal(signal.SIGINT, extended_signal_handler)
+        # --- End observation visualization initialization ---
  
         self.joint_pos_limits = self.snake_robot.data.soft_joint_pos_limits
         self.joint_pos_lower_limits = self.joint_pos_limits[..., 0].to(self.device) # Ellipsis (...) means all preceding dims
@@ -384,7 +439,7 @@ class SnakeEnv(DirectRLEnv):
         joint_pos = self.snake_robot.data.joint_pos
         joint_vel = self.snake_robot.data.joint_vel
 
-        # # Calculate joint positions normalized to [-1, 1]
+        # Calculate joint positions normalized to [-1, 1]
         joint_pos_normalized = 2.0 * (joint_pos - self.joint_pos_lower_limits) / self.joint_pos_ranges - 1.0
         # Get root state information
         root_pos = self.snake_robot.data.root_pos_w
@@ -403,6 +458,15 @@ class SnakeEnv(DirectRLEnv):
             dim=-1,
         )
         
+        # Store observation data for visualization if enabled
+        if self.visualize_observations and len(self.observation_viz_data["timesteps"]) < self.max_visualization_points:
+            self.observation_viz_data["timesteps"].append(self.sim.current_time)
+            self.observation_viz_data["joint_pos"].append(joint_pos_normalized[self.visualization_env_id].clone().cpu().numpy())
+            self.observation_viz_data["joint_vel"].append((joint_vel * 0.1)[self.visualization_env_id].clone().cpu().numpy())
+            self.observation_viz_data["root_pos"].append(root_pos[self.visualization_env_id].clone().cpu().numpy())
+            self.observation_viz_data["root_quat"].append(root_quat[self.visualization_env_id].clone().cpu().numpy())
+            self.observation_viz_data["root_lin_vel"].append(root_lin_vel[self.visualization_env_id].clone().cpu().numpy())
+        
         if self.use_history:
             # Shift the history buffer (discard oldest, make room for newest)
             self.obs_history = self.obs_history.roll(-1, dims=1)
@@ -415,6 +479,10 @@ class SnakeEnv(DirectRLEnv):
             # to [num_envs, history_length * single_obs_size]
             policy_obs = self.obs_history.reshape(self.num_envs, -1)
             
+            # Store the flattened policy observation for visualization
+            if self.visualize_observations and len(self.observation_viz_data["timesteps"]) < self.max_visualization_points:
+                self.observation_viz_data["flattened_policy_obs"].append(policy_obs[self.visualization_env_id].clone().cpu().numpy())
+            
             # Optional: add observation normalization if needed
             # policy_obs = torch.clamp(policy_obs, -10.0, 10.0)
             
@@ -422,6 +490,10 @@ class SnakeEnv(DirectRLEnv):
         else:
             # Just use the current observation if history is disabled
             observations = {"policy": current_obs}
+            
+            # Store the policy observation for visualization
+            if self.visualize_observations and len(self.observation_viz_data["timesteps"]) < self.max_visualization_points:
+                self.observation_viz_data["flattened_policy_obs"].append(current_obs[self.visualization_env_id].clone().cpu().numpy())
         
         return observations
 
@@ -889,3 +961,200 @@ class SnakeEnv(DirectRLEnv):
             print(f"Saved velocity tracking data and plot to {filename} at t={self.sim.current_time:.2f}s")
         
         return filename
+
+    # Add a new method to save observation plots
+    def save_observation_plots(self):
+        print("#############################################")
+        print("Saving observation visualization plots")
+        print("#############################################")
+        
+        # Check if we have data to plot
+        if not self.observation_viz_data["timesteps"]:
+            print("No observation data to plot!")
+            return
+            
+        import matplotlib.pyplot as plt
+        from datetime import datetime
+        import os
+        import numpy as np
+        
+        # Create output directory if it doesn't exist
+        output_dir = os.path.join(os.getcwd(), "observation_plots")
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Get timestamp for filenames
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Convert lists to numpy arrays for easier plotting
+        times = np.array(self.observation_viz_data["timesteps"])
+        
+        # Count of data points collected
+        num_points = len(times)
+        print(f"Plotting {num_points} observation data points")
+        
+        # --- Plot 1: Joint Positions ---
+        if "joint_pos" in self.components_to_plot:
+            joint_positions = np.array(self.observation_viz_data["joint_pos"])
+            num_joints = joint_positions.shape[1]
+            
+            fig, ax = plt.subplots(figsize=(12, 8))
+            for j in range(num_joints):
+                ax.plot(times, joint_positions[:, j], label=f'Joint {j+1}')
+            
+            ax.set_xlabel('Time (s)')
+            ax.set_ylabel('Normalized Joint Position [-1, 1]')
+            ax.set_title(f'Normalized Joint Positions Over Time - Env {self.visualization_env_id}')
+            ax.legend(loc='upper right')
+            ax.grid(True)
+            
+            # Save the plot
+            filename = os.path.join(output_dir, f'joint_positions_{timestamp}.png')
+            plt.savefig(filename)
+            plt.close()
+            print(f"Saved joint position plot to {filename}")
+            
+        # --- Plot 2: Joint Velocities ---
+        if "joint_vel" in self.components_to_plot:
+            joint_velocities = np.array(self.observation_viz_data["joint_vel"])
+            num_joints = joint_velocities.shape[1]
+            
+            fig, ax = plt.subplots(figsize=(12, 8))
+            for j in range(num_joints):
+                ax.plot(times, joint_velocities[:, j], label=f'Joint {j+1}')
+            
+            ax.set_xlabel('Time (s)')
+            ax.set_ylabel('Scaled Joint Velocity')
+            ax.set_title(f'Scaled Joint Velocities Over Time - Env {self.visualization_env_id}')
+            ax.legend(loc='upper right')
+            ax.grid(True)
+            
+            # Save the plot
+            filename = os.path.join(output_dir, f'joint_velocities_{timestamp}.png')
+            plt.savefig(filename)
+            plt.close()
+            print(f"Saved joint velocity plot to {filename}")
+            
+        # --- Plot 3: Root Position ---
+        if "root_pos" in self.components_to_plot:
+            root_positions = np.array(self.observation_viz_data["root_pos"])
+            
+            fig, ax = plt.subplots(figsize=(12, 8))
+            ax.plot(times, root_positions[:, 0], label='X Position')
+            ax.plot(times, root_positions[:, 1], label='Y Position')
+            ax.plot(times, root_positions[:, 2], label='Z Position')
+            
+            ax.set_xlabel('Time (s)')
+            ax.set_ylabel('Position (m)')
+            ax.set_title(f'Root Position Over Time - Env {self.visualization_env_id}')
+            ax.legend(loc='upper right')
+            ax.grid(True)
+            
+            # Save the plot
+            filename = os.path.join(output_dir, f'root_position_{timestamp}.png')
+            plt.savefig(filename)
+            plt.close()
+            print(f"Saved root position plot to {filename}")
+            
+        # --- Plot 4: Root Linear Velocity ---
+        if "root_lin_vel" in self.components_to_plot:
+            root_lin_vels = np.array(self.observation_viz_data["root_lin_vel"])
+            
+            fig, ax = plt.subplots(figsize=(12, 8))
+            ax.plot(times, root_lin_vels[:, 0], label='X Velocity')
+            ax.plot(times, root_lin_vels[:, 1], label='Y Velocity')
+            ax.plot(times, root_lin_vels[:, 2], label='Z Velocity')
+            
+            ax.set_xlabel('Time (s)')
+            ax.set_ylabel('Velocity (m/s)')
+            ax.set_title(f'Root Linear Velocity Over Time - Env {self.visualization_env_id}')
+            ax.legend(loc='upper right')
+            ax.grid(True)
+            
+            # Save the plot
+            filename = os.path.join(output_dir, f'root_linear_velocity_{timestamp}.png')
+            plt.savefig(filename)
+            plt.close()
+            print(f"Saved root linear velocity plot to {filename}")
+            
+        # --- Plot 5: Root Orientation (Quaternion) ---
+        if "root_quat" in self.components_to_plot:
+            root_quats = np.array(self.observation_viz_data["root_quat"])
+            
+            fig, ax = plt.subplots(figsize=(12, 8))
+            ax.plot(times, root_quats[:, 0], label='Quat W')
+            ax.plot(times, root_quats[:, 1], label='Quat X')
+            ax.plot(times, root_quats[:, 2], label='Quat Y')
+            ax.plot(times, root_quats[:, 3], label='Quat Z')
+            
+            ax.set_xlabel('Time (s)')
+            ax.set_ylabel('Quaternion Values')
+            ax.set_title(f'Root Orientation Quaternion Over Time - Env {self.visualization_env_id}')
+            ax.legend(loc='upper right')
+            ax.grid(True)
+            
+            # Save the plot
+            filename = os.path.join(output_dir, f'root_orientation_{timestamp}.png')
+            plt.savefig(filename)
+            plt.close()
+            print(f"Saved root orientation plot to {filename}")
+            
+        # --- Plot 6: Policy Observation (flattened) ---
+        # This is more complex, but useful to verify the shape and pattern
+        # of observations actually passed to the policy
+        if "flattened_policy_obs" in self.components_to_plot:
+            flattened_obs = np.array(self.observation_viz_data["flattened_policy_obs"])
+            
+            # To visualize this complex data, let's create a heatmap of the observations over time
+            plt.figure(figsize=(15, 10))
+            
+            # Create a 2D heatmap where:
+            # - X-axis: observation dimension
+            # - Y-axis: time
+            # - Color: observation value
+            plt.imshow(flattened_obs, aspect='auto', interpolation='none', cmap='viridis')
+            
+            plt.colorbar(label='Observation Value')
+            plt.xlabel('Observation Dimension')
+            plt.ylabel('Time Step')
+            plt.title(f'Policy Observation Heatmap Over Time - Env {self.visualization_env_id}')
+            
+            # Save the plot
+            filename = os.path.join(output_dir, f'policy_observations_heatmap_{timestamp}.png')
+            plt.savefig(filename)
+            plt.close()
+            print(f"Saved policy observation heatmap to {filename}")
+            
+            # Also save a line plot for the first few dimensions
+            max_dims_to_plot = min(20, flattened_obs.shape[1])  # Plot at most 20 dimensions
+            
+            plt.figure(figsize=(15, 10))
+            for i in range(max_dims_to_plot):
+                plt.plot(times, flattened_obs[:, i], label=f'Dim {i}')
+                
+            plt.xlabel('Time (s)')
+            plt.ylabel('Observation Value')
+            plt.title(f'First {max_dims_to_plot} Policy Observation Dimensions - Env {self.visualization_env_id}')
+            plt.legend(loc='upper right', ncol=4)
+            plt.grid(True)
+            
+            # Save the plot
+            filename = os.path.join(output_dir, f'policy_observations_line_{timestamp}.png')
+            plt.savefig(filename)
+            plt.close()
+            print(f"Saved policy observation line plot to {filename}")
+        
+        # Save raw data for further analysis
+        raw_data_filename = os.path.join(output_dir, f'observation_raw_data_{timestamp}.npz')
+        np.savez(
+            raw_data_filename,
+            times=times,
+            joint_positions=np.array(self.observation_viz_data["joint_pos"]),
+            joint_velocities=np.array(self.observation_viz_data["joint_vel"]),
+            root_positions=np.array(self.observation_viz_data["root_pos"]),
+            root_quaternions=np.array(self.observation_viz_data["root_quat"]),
+            root_linear_velocities=np.array(self.observation_viz_data["root_lin_vel"]),
+            policy_observations=np.array(self.observation_viz_data["flattened_policy_obs"])
+        )
+        print(f"Saved raw observation data to {raw_data_filename}")
+        
+        return output_dir
