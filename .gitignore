@@ -63,3 +63,5 @@ _build
 
 # Misc.
 joint_tracking_plots/*
+logs_bak/*
+observation_plots/*
