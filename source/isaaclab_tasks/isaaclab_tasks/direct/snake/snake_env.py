@@ -129,7 +129,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     class TestingCfg:
         """Configuration for testing modes."""
         # Set to True to override RL actions with manual oscillation
-        enable_manual_oscillation: bool = True
+        enable_manual_oscillation: bool = False
         
         # --- Sidewinding parameters ---
         # Amplitude in degrees (will be converted to radians)
@@ -176,7 +176,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     @configclass
     class ObservationVisualizationCfg:
         """Configuration for observation visualization."""
-        enable: bool = True
+        enable: bool = False
         env_id: int = 0  # Which environment to visualize
         max_points: int = 1000  # Maximum number of data points to collect
         save_interval_s: float = 10.0  # How often to save plots (seconds)
@@ -377,8 +377,8 @@ class SnakeEnv(DirectRLEnv):
             
             # Print debug info occasionally
             if self.env_step_counter % 20 == 0:
-                print(f"Step: {self.env_step_counter}, Time: {current_time:.4f}")
-                print(f"Vel targets (first 3 joints, rad/s): {velocity_targets[:3].cpu().numpy().round(4)}")
+                # print(f"Step: {self.env_step_counter}, Time: {current_time:.4f}")
+                # print(f"Vel targets (first 3 joints, rad/s): {velocity_targets[:3].cpu().numpy().round(4)}")
                 
                 # Optional: Calculate and print expected positions (integral of velocity)
                 positions = []
@@ -388,7 +388,7 @@ class SnakeEnv(DirectRLEnv):
                     else:  # Odd joints
                         pos = amplitude_y_rad * torch.sin(torch.tensor(omega_y * current_time + i * delta_y + phi))
                     positions.append(pos.item())
-                print(f"Expected pos (first 3 joints, rad): {np.array(positions).round(4)}")
+                # print(f"Expected pos (first 3 joints, rad): {np.array(positions).round(4)}")
                     
             # Set self.actions for potential use in reward calculations
             self.actions = torch.zeros_like(actions)
@@ -441,19 +441,30 @@ class SnakeEnv(DirectRLEnv):
 
         # Calculate joint positions normalized to [-1, 1]
         joint_pos_normalized = 2.0 * (joint_pos - self.joint_pos_lower_limits) / self.joint_pos_ranges - 1.0
-        # Get root state information
-        root_pos = self.snake_robot.data.root_pos_w
+        
+        # Get root state information in world frame
+        root_pos_w = self.snake_robot.data.root_pos_w
         root_quat = self.snake_robot.data.root_quat_w
-        root_lin_vel = self.snake_robot.data.root_lin_vel_w
+        root_lin_vel_w = self.snake_robot.data.root_lin_vel_w
+        
+        # Convert positions from world frame to spawn-relative frame
+        # This creates a frame with origin at the robot's spawn point
+        # but the axes still align with the world frame (not rotating with the robot)
+        root_pos = root_pos_w - self.scene.env_origins
+        
+        # Use the same spawn-relative frame for velocities
+        # No rotation needed - we want to keep measuring velocity relative to the world axes
+        # just like the position
+        root_lin_vel = root_lin_vel_w  # Keep velocities in world frame orientation
         
         # Combine observations (current frame only)
         current_obs = torch.cat(
             (
                 joint_pos_normalized,   # Normalized joint positions
                 joint_vel * 0.1,        # Scaled joint velocities
-                root_pos,               # Root position
+                root_pos,               # Root position (spawn-relative frame)
                 root_quat,              # Root orientation
-                root_lin_vel,           # Root linear velocity
+                root_lin_vel,           # Root linear velocity (world frame orientation)
             ),
             dim=-1,
         )
@@ -466,6 +477,16 @@ class SnakeEnv(DirectRLEnv):
             self.observation_viz_data["root_pos"].append(root_pos[self.visualization_env_id].clone().cpu().numpy())
             self.observation_viz_data["root_quat"].append(root_quat[self.visualization_env_id].clone().cpu().numpy())
             self.observation_viz_data["root_lin_vel"].append(root_lin_vel[self.visualization_env_id].clone().cpu().numpy())
+            
+            # Also store world-frame data for comparison in visualization
+            if "root_pos_w" not in self.observation_viz_data:
+                self.observation_viz_data["root_pos_w"] = []
+                self.observation_viz_data["root_lin_vel_w"] = []
+                self.observation_viz_data["env_origin"] = []
+            
+            self.observation_viz_data["root_pos_w"].append(root_pos_w[self.visualization_env_id].clone().cpu().numpy())
+            self.observation_viz_data["root_lin_vel_w"].append(root_lin_vel_w[self.visualization_env_id].clone().cpu().numpy())
+            self.observation_viz_data["env_origin"].append(self.scene.env_origins[self.visualization_env_id].clone().cpu().numpy())
         
         if self.use_history:
             # Shift the history buffer (discard oldest, make room for newest)
@@ -511,13 +532,18 @@ class SnakeEnv(DirectRLEnv):
         # 1. Forward velocity (x-direction)
         # 2. Lateral velocity (y-direction) - important for sidewinding
         
-        # Get velocities for all links
-        link_velocities = self.snake_robot.data.body_vel_w  # Shape: [num_envs, num_links, 6]
+        # Get velocities for all links in world frame
+        link_velocities_w = self.snake_robot.data.body_vel_w  # Shape: [num_envs, num_links, 6]
         
         # The first 3 components are linear velocity [vx, vy, vz]
-        link_linear_vels = link_velocities[:, :, :3]  # Extract linear velocities for all links
+        link_linear_vels = link_velocities_w[:, :, :3]  # Extract linear velocities for all links
+        
+        # Note: We keep the velocities in world coordinates (relative to fixed axes)
+        # We don't need to transform to body frame since we want to measure absolute motion
+        # This matches how velocities are used in the observation space
         
         # Target velocities for sidewinding (forward + lateral movement)
+        # Forward is along x-axis, lateral is along y-axis in world coordinates
         target_forward_vel = torch.ones((self.num_envs,), device=self.device) * 0.5  # Target forward velocity of 0.5 m/s
         target_lateral_vel = torch.ones((self.num_envs,), device=self.device)  # Target lateral velocity of 1 m/s (for sidewinding)
         
@@ -530,9 +556,18 @@ class SnakeEnv(DirectRLEnv):
         if len(valid_indices) == 0:
             valid_indices = torch.tensor([0], device=self.device)
             
-        # Extract tracked link velocities
+        # Extract tracked link velocities (world frame orientation)
         tracked_links_forward_vel = link_linear_vels[:, valid_indices, 0]  # [num_envs, num_tracked_links]
         tracked_links_lateral_vel = link_linear_vels[:, valid_indices, 1]  # [num_envs, num_tracked_links]
+        
+        # Log velocities for debugging (first environment only)
+        if self.env_step_counter % 100 == 0:
+            forward_vel = tracked_links_forward_vel[0, 0].item()
+            lateral_vel = tracked_links_lateral_vel[0, 0].item()
+            # print(f"[Step {self.env_step_counter}] Link {valid_indices[0].item()} velocities:")
+            # print(f"  X velocity (forward): {forward_vel:.3f} m/s")
+            # print(f"  Y velocity (lateral): {lateral_vel:.3f} m/s")
+            # print(f"  Targets: forward={target_forward_vel[0].item():.3f}, lateral={target_lateral_vel[0].item():.3f}")
         
         # Calculate squared error for tracked links compared to target (broadcasting the target)
         forward_vel_errors = (tracked_links_forward_vel - target_forward_vel.unsqueeze(1)) ** 2  # [num_envs, num_tracked_links]
@@ -634,14 +669,14 @@ class SnakeEnv(DirectRLEnv):
         if self.env_step_counter % 100 == 0:  # Only log occasionally to avoid overhead
             num_too_high = torch.sum(too_high).item()
             if num_too_high > 0:
-                print(f"[Step {self.env_step_counter}] Terminating {num_too_high} environments due to links being too high")
+                # print(f"[Step {self.env_step_counter}] Terminating {num_too_high} environments due to links being too high")
                 
                 # For the first environment with high links, log details about which links are too high
                 if too_high[0]:
                     first_env_heights = link_heights[0]
                     high_links = (first_env_heights > self.cfg.link_length).nonzero().flatten()
                     high_link_heights = first_env_heights[high_links]
-                    print(f"  Env 0: Links {high_links.cpu().numpy()} are too high with heights {high_link_heights.cpu().numpy()}")
+                    # print(f"  Env 0: Links {high_links.cpu().numpy()} are too high with heights {high_link_heights.cpu().numpy()}")
         
         # Add termination reason info to extras
         if "episode" not in self.extras:
@@ -1034,10 +1069,68 @@ class SnakeEnv(DirectRLEnv):
             plt.close()
             print(f"Saved joint velocity plot to {filename}")
             
-        # --- Plot 3: Root Position ---
-        if "root_pos" in self.components_to_plot:
+        # --- Plot 3: Root Position (World vs Local Frame) ---
+        if "root_pos" in self.components_to_plot and "root_pos_w" in self.observation_viz_data:
             root_positions = np.array(self.observation_viz_data["root_pos"])
+            root_positions_w = np.array(self.observation_viz_data["root_pos_w"])
+            env_origins = np.array(self.observation_viz_data["env_origin"])
             
+            # Create a 2x3 subplot grid (2 rows, 3 columns)
+            fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+            
+            # Row 1: World frame position and environment origin
+            axes[0, 0].plot(times, root_positions_w[:, 0], 'b-', label='X Position (World)')
+            axes[0, 0].plot(times, env_origins[:, 0], 'b--', label='X Origin')
+            axes[0, 0].set_ylabel('X Position (m)')
+            axes[0, 0].set_title('X Position - World Frame')
+            axes[0, 0].legend()
+            axes[0, 0].grid(True)
+            
+            axes[0, 1].plot(times, root_positions_w[:, 1], 'g-', label='Y Position (World)')
+            axes[0, 1].plot(times, env_origins[:, 1], 'g--', label='Y Origin')
+            axes[0, 1].set_ylabel('Y Position (m)')
+            axes[0, 1].set_title('Y Position - World Frame')
+            axes[0, 1].legend()
+            axes[0, 1].grid(True)
+            
+            axes[0, 2].plot(times, root_positions_w[:, 2], 'r-', label='Z Position (World)')
+            axes[0, 2].plot(times, env_origins[:, 2], 'r--', label='Z Origin')
+            axes[0, 2].set_ylabel('Z Position (m)')
+            axes[0, 2].set_title('Z Position - World Frame')
+            axes[0, 2].legend()
+            axes[0, 2].grid(True)
+            
+            # Row 2: Local frame position
+            axes[1, 0].plot(times, root_positions[:, 0], 'b-', label='X Position (Local)')
+            axes[1, 0].set_xlabel('Time (s)')
+            axes[1, 0].set_ylabel('X Position (m)')
+            axes[1, 0].set_title('X Position - Local Frame')
+            axes[1, 0].legend()
+            axes[1, 0].grid(True)
+            
+            axes[1, 1].plot(times, root_positions[:, 1], 'g-', label='Y Position (Local)')
+            axes[1, 1].set_xlabel('Time (s)')
+            axes[1, 1].set_ylabel('Y Position (m)')
+            axes[1, 1].set_title('Y Position - Local Frame')
+            axes[1, 1].legend()
+            axes[1, 1].grid(True)
+            
+            axes[1, 2].plot(times, root_positions[:, 2], 'r-', label='Z Position (Local)')
+            axes[1, 2].set_xlabel('Time (s)')
+            axes[1, 2].set_ylabel('Z Position (m)')
+            axes[1, 2].set_title('Z Position - Local Frame')
+            axes[1, 2].legend()
+            axes[1, 2].grid(True)
+            
+            plt.tight_layout()
+            
+            # Save the plot
+            filename = os.path.join(output_dir, f'root_position_comparison_{timestamp}.png')
+            plt.savefig(filename)
+            plt.close()
+            print(f"Saved root position comparison plot to {filename}")
+            
+            # Also save the original single plot for local frame
             fig, ax = plt.subplots(figsize=(12, 8))
             ax.plot(times, root_positions[:, 0], label='X Position')
             ax.plot(times, root_positions[:, 1], label='Y Position')
@@ -1045,7 +1138,7 @@ class SnakeEnv(DirectRLEnv):
             
             ax.set_xlabel('Time (s)')
             ax.set_ylabel('Position (m)')
-            ax.set_title(f'Root Position Over Time - Env {self.visualization_env_id}')
+            ax.set_title(f'Root Position (Local Frame) Over Time - Env {self.visualization_env_id}')
             ax.legend(loc='upper right')
             ax.grid(True)
             
@@ -1053,12 +1146,59 @@ class SnakeEnv(DirectRLEnv):
             filename = os.path.join(output_dir, f'root_position_{timestamp}.png')
             plt.savefig(filename)
             plt.close()
-            print(f"Saved root position plot to {filename}")
             
-        # --- Plot 4: Root Linear Velocity ---
-        if "root_lin_vel" in self.components_to_plot:
+        # --- Plot 4: Root Linear Velocity (World vs Local Frame) ---
+        if "root_lin_vel" in self.components_to_plot and "root_lin_vel_w" in self.observation_viz_data:
             root_lin_vels = np.array(self.observation_viz_data["root_lin_vel"])
+            root_lin_vels_w = np.array(self.observation_viz_data["root_lin_vel_w"])
             
+            # Create a 2x3 subplot grid
+            fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+            
+            # Row 1: World frame velocities
+            axes[0, 0].plot(times, root_lin_vels_w[:, 0], 'b-')
+            axes[0, 0].set_ylabel('X Velocity (m/s)')
+            axes[0, 0].set_title('X Velocity - World Frame')
+            axes[0, 0].grid(True)
+            
+            axes[0, 1].plot(times, root_lin_vels_w[:, 1], 'g-')
+            axes[0, 1].set_ylabel('Y Velocity (m/s)')
+            axes[0, 1].set_title('Y Velocity - World Frame')
+            axes[0, 1].grid(True)
+            
+            axes[0, 2].plot(times, root_lin_vels_w[:, 2], 'r-')
+            axes[0, 2].set_ylabel('Z Velocity (m/s)')
+            axes[0, 2].set_title('Z Velocity - World Frame')
+            axes[0, 2].grid(True)
+            
+            # Row 2: Local frame velocities
+            axes[1, 0].plot(times, root_lin_vels[:, 0], 'b-')
+            axes[1, 0].set_xlabel('Time (s)')
+            axes[1, 0].set_ylabel('X Velocity (m/s)')
+            axes[1, 0].set_title('X Velocity - Local Frame')
+            axes[1, 0].grid(True)
+            
+            axes[1, 1].plot(times, root_lin_vels[:, 1], 'g-')
+            axes[1, 1].set_xlabel('Time (s)')
+            axes[1, 1].set_ylabel('Y Velocity (m/s)')
+            axes[1, 1].set_title('Y Velocity - Local Frame')
+            axes[1, 1].grid(True)
+            
+            axes[1, 2].plot(times, root_lin_vels[:, 2], 'r-')
+            axes[1, 2].set_xlabel('Time (s)')
+            axes[1, 2].set_ylabel('Z Velocity (m/s)')
+            axes[1, 2].set_title('Z Velocity - Local Frame')
+            axes[1, 2].grid(True)
+            
+            plt.tight_layout()
+            
+            # Save the plot
+            filename = os.path.join(output_dir, f'root_velocity_comparison_{timestamp}.png')
+            plt.savefig(filename)
+            plt.close()
+            print(f"Saved root velocity comparison plot to {filename}")
+            
+            # Also save the original single plot for local frame
             fig, ax = plt.subplots(figsize=(12, 8))
             ax.plot(times, root_lin_vels[:, 0], label='X Velocity')
             ax.plot(times, root_lin_vels[:, 1], label='Y Velocity')
@@ -1066,7 +1206,7 @@ class SnakeEnv(DirectRLEnv):
             
             ax.set_xlabel('Time (s)')
             ax.set_ylabel('Velocity (m/s)')
-            ax.set_title(f'Root Linear Velocity Over Time - Env {self.visualization_env_id}')
+            ax.set_title(f'Root Linear Velocity (Local Frame) Over Time - Env {self.visualization_env_id}')
             ax.legend(loc='upper right')
             ax.grid(True)
             
@@ -1074,7 +1214,6 @@ class SnakeEnv(DirectRLEnv):
             filename = os.path.join(output_dir, f'root_linear_velocity_{timestamp}.png')
             plt.savefig(filename)
             plt.close()
-            print(f"Saved root linear velocity plot to {filename}")
             
         # --- Plot 5: Root Orientation (Quaternion) ---
         if "root_quat" in self.components_to_plot:
@@ -1150,10 +1289,14 @@ class SnakeEnv(DirectRLEnv):
             times=times,
             joint_positions=np.array(self.observation_viz_data["joint_pos"]),
             joint_velocities=np.array(self.observation_viz_data["joint_vel"]),
-            root_positions=np.array(self.observation_viz_data["root_pos"]),
+            root_positions=np.array(self.observation_viz_data["root_pos"]), 
             root_quaternions=np.array(self.observation_viz_data["root_quat"]),
             root_linear_velocities=np.array(self.observation_viz_data["root_lin_vel"]),
-            policy_observations=np.array(self.observation_viz_data["flattened_policy_obs"])
+            policy_observations=np.array(self.observation_viz_data["flattened_policy_obs"]),
+            # Add world frame data if available
+            root_positions_world=np.array(self.observation_viz_data.get("root_pos_w", [[0, 0, 0]])),
+            root_linear_velocities_world=np.array(self.observation_viz_data.get("root_lin_vel_w", [[0, 0, 0]])),
+            env_origins=np.array(self.observation_viz_data.get("env_origin", [[0, 0, 0]]))
         )
         print(f"Saved raw observation data to {raw_data_filename}")
         

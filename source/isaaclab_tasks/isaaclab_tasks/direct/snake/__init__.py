@@ -7,7 +7,7 @@ from . import agents
 ##
 
 gym.register(
-    id="Isaac-Snake-Direct-v3_cmd-l-1-5-10",
+    id="Isaac-Snake-Direct-v3_cmd-l-1-5-10_localpose",
     entry_point=f"{__name__}.snake_env:SnakeEnv",
     disable_env_checker=True,
     kwargs={
