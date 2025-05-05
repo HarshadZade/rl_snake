@@ -29,10 +29,10 @@ from isaaclab.terrains import TerrainImporter
 class SnakeEnvCfg(DirectRLEnvCfg):
     # env
     decimation = 2
-    episode_length_s = 100.0
-    action_scale = 1.0  # rad/s - velocity control scale  #TODO: tune this
+    episode_length_s = 20.0
+    action_scale = 0.5  # rad/s - velocity control scale  #TODO: tune this
     action_space = 9    # 9 joints
-    observation_space = 28
+    observation_space = 18  # 9 joints * 2 values (normalized positions + scaled velocities)
     state_space = 0
     link_length = 4.0  #TODO: Get this from the USD instead of hardcoding # Length of each link in meters, used for height termination
 
@@ -40,13 +40,13 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation)
 
     # scene
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=40.0, replicate_physics=True)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=64, env_spacing=40.0, replicate_physics=True)
 
     # -- Robot Configuration (Loading from USD)
     robot: ArticulationCfg = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot", # Standard prim path pattern
         spawn=sim_utils.UsdFileCfg(
-            usd_path="./source/isaaclab_tasks/isaaclab_tasks/direct/snake/usd_files/snake_velocity.usd",
+            usd_path="./source/isaaclab_tasks/isaaclab_tasks/direct/snake/usd_files/snake_velocity-fixedbase.usd",
             activate_contact_sensors=False, # Set to True if you need contact sensors #TODO: check this
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=False,
@@ -55,7 +55,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
                 enabled_self_collisions=True,
                 solver_position_iteration_count=8, 
-                solver_velocity_iteration_count=0,
+                solver_velocity_iteration_count=4, # Increase velocity iterations
             ),
         ),
         init_state=ArticulationCfg.InitialStateCfg(
@@ -71,7 +71,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
                  "joint_8": 0.0,
                  "joint_9": 0.0,
             },
-            pos=(0.0, 0.0, 1.0),  # Initial base position (adjust height based on robot)
+            pos=(0.0, 0.0, 0.0),  # Initial base position (adjust height based on robot)
             rot=(0.0, 0.0, 0.0, 1.0), # Initial base orientation
         ),
         actuators={
@@ -79,12 +79,11 @@ class SnakeEnvCfg(DirectRLEnvCfg):
             "snake_joints": ImplicitActuatorCfg(
                 # Use regex matching your joint names, or list them
                 joint_names_expr=["joint_[1-9]"], # Example regex
-                effort_limit=100000.0,   # <<< Tune based on your robot's specs
-                velocity_limit=10.0,  # <<< Tune based on your robot's specs
-                stiffness=0.0,       # <<< Tune: Use >0 for position/velocity control
-                damping=100000.0,        # <<< Tune: Use >0 for position/velocity control (helps stability)
+                effort_limit=100000.0,
+                velocity_limit=5.0,      # Reduced from 10.0
+                stiffness=10.0,          # Add stiffness for position holding (was 0.0)
+                damping=1.0,             # Reduce damping to avoid over-damping (was 100000.0)
             ),
-            # Add more actuator groups if joints have different properties
         },
     )
 
@@ -112,16 +111,16 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     action_scale = 1.0  # rad/s - For velocity control, scale can be larger than position control
     
     # reward scales 
-    rew_scale_forward_velocity = 0.0  # Not using this in LQR approach
-    rew_scale_joint_vel_penalty = -0.0001  # Small penalty on joint velocities (control cost)
-    rew_scale_termination = 0.0
-    rew_scale_alive = 1.0  # Small alive bonus
-    rew_scale_action_smoothness_penalty = 0.0
-    rew_scale_lateral_velocity_penalty = 0.0
+    rew_scale_forward_velocity = 0.0  # Not using this in fixed-base approach
+    rew_scale_joint_vel_penalty = 0.0  # Not using this directly
+    rew_scale_termination = -10.0  # Penalty for termination
+    rew_scale_alive = 0.1  # Small alive bonus
+    rew_scale_action_smoothness_penalty = 0.0  # Not using this
+    rew_scale_lateral_velocity_penalty = 0.0  # Not using this
     rew_scale_joint_limit_penalty = -5.0  # Keep joint limit penalty
     
-    # LQR reward parameters
-    rew_scale_state_tracking = 10.0  # Weight for state tracking term
+    # Position tracking reward parameters
+    rew_scale_state_tracking = 10.0  # Weight for position tracking term (renamed from state_tracking)
     rew_scale_control_cost = -0.001  # Weight for control cost term
     
     # --- ADD TESTING CONFIGURATION ---
@@ -153,8 +152,8 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     @configclass
     class PositionTrackingCfg:
         """Configuration for velocity tracking analysis."""
-        enable: bool = False
-        env_id: int = 0     # Which environment to track
+        enable: bool = True
+        env_id: int = 10     # Which environment to track
         track_all_joints: bool = True  # Whether to track all joints or just one
         joint_id: int = 0   # Which joint to track (if not tracking all)
         max_points: int = 1000  # Maximum number of data points to collect
@@ -176,11 +175,11 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     @configclass
     class ObservationVisualizationCfg:
         """Configuration for observation visualization."""
-        enable: bool = False
-        env_id: int = 0  # Which environment to visualize
+        enable: bool = True
+        env_id: int = 10  # Which environment to visualize
         max_points: int = 1000  # Maximum number of data points to collect
         save_interval_s: float = 10.0  # How often to save plots (seconds)
-        components_to_plot: list = ["joint_pos", "joint_vel", "root_pos", "root_lin_vel"]  # Which components to plot
+        components_to_plot: list = ["joint_pos", "joint_vel", "root_pos", "root_lin_vel", "root_pos_w"]  # Which components to plot
     
     observation_visualization: ObservationVisualizationCfg = ObservationVisualizationCfg()
     # --- END OBSERVATION VISUALIZATION CONFIG ---
@@ -224,13 +223,17 @@ class SnakeEnv(DirectRLEnv):
             def signal_handler(sig, frame):
                 print("\nCaught interrupt signal. Saving velocity tracking plot before exiting...")
                 self.save_position_tracking_plot()
-                print("Plot saved. Exiting...")
+                # Also save root position debug plots
+                if hasattr(self, 'visualize_observations') and self.visualize_observations:
+                    print("Saving root position debug plots...")
+                    self.save_root_position_debug_plot()
+                print("Plots saved. Exiting...")
                 import sys
                 sys.exit(0)
             
             # Register the signal handler for SIGINT
             signal.signal(signal.SIGINT, signal_handler)
-        
+         
         # --- Initialize observation history ---
         self.use_history = self.cfg.observation_history.enable
         if self.use_history:
@@ -260,10 +263,6 @@ class SnakeEnv(DirectRLEnv):
                 "timesteps": [],
                 "joint_pos": [],
                 "joint_vel": [],
-                "root_pos": [],
-                "root_quat": [],
-                "root_lin_vel": [],
-                "flattened_policy_obs": [],  # Store the flattened policy observation for verification
             }
             
             print(f"[Info] Observation visualization enabled for Env {self.visualization_env_id}.")
@@ -277,6 +276,10 @@ class SnakeEnv(DirectRLEnv):
             def extended_signal_handler(sig, frame):
                 print("\nCaught interrupt signal. Saving observation visualization plots before exiting...")
                 self.save_observation_plots()
+                
+                # Explicitly save the root position debug plots as well
+                print("Saving root position debug plots...")
+                self.save_root_position_debug_plot()
                 
                 # Call the original handler if it exists
                 if callable(original_sigint_handler):
@@ -319,6 +322,11 @@ class SnakeEnv(DirectRLEnv):
         
         # clone and replicate
         self.scene.clone_environments(copy_from_source=False)
+        
+        # Print environment origins for verification
+        if self.cfg.scene.num_envs < 10:  # Only print if small number of envs
+            for i in range(self.cfg.scene.num_envs):
+                print(f"Env {i} origin: {self.scene.env_origins[i].cpu().numpy()}")
         
         # Add robot to the scene's list of articulations
         self.scene.articulations["snake_robot"] = self.snake_robot
@@ -375,21 +383,6 @@ class SnakeEnv(DirectRLEnv):
             # Expand to all environments
             self.joint_vel_targets[:] = velocity_targets.unsqueeze(0).expand(self.num_envs, -1)
             
-            # Print debug info occasionally
-            if self.env_step_counter % 20 == 0:
-                # print(f"Step: {self.env_step_counter}, Time: {current_time:.4f}")
-                # print(f"Vel targets (first 3 joints, rad/s): {velocity_targets[:3].cpu().numpy().round(4)}")
-                
-                # Optional: Calculate and print expected positions (integral of velocity)
-                positions = []
-                for i in range(min(3, num_joints)):  # First 3 joints
-                    if i % 2 == 0:  # Even joints
-                        pos = amplitude_x_rad * torch.sin(torch.tensor(omega_x * current_time + i * delta_x))
-                    else:  # Odd joints
-                        pos = amplitude_y_rad * torch.sin(torch.tensor(omega_y * current_time + i * delta_y + phi))
-                    positions.append(pos.item())
-                # print(f"Expected pos (first 3 joints, rad): {np.array(positions).round(4)}")
-                    
             # Set self.actions for potential use in reward calculations
             self.actions = torch.zeros_like(actions)
             
@@ -401,12 +394,42 @@ class SnakeEnv(DirectRLEnv):
             # Map [-1, 1] to desired velocity range using action_scale
             velocity_targets = self.action_scale * self.actions
             
-            # Set joint velocity targets directly - no need to accumulate like position
-            self.joint_vel_targets[:] = velocity_targets
+            # Apply velocity rate limiting for stability
+            # Compute the change in velocity targets
+            velocity_change = velocity_targets - self.joint_vel_targets
+            
+            # Limit the rate of change to 0.05 rad/s per step for stability
+            max_change = 0.05
+            limited_change = torch.clamp(velocity_change, -max_change, max_change)
+            
+            # Apply the limited change
+            self.joint_vel_targets = self.joint_vel_targets + limited_change
 
     def _apply_action(self) -> None:
         # Use velocity control instead of position control
+        self.joint_vel_targets[:] = 0.0
         self.snake_robot.set_joint_velocity_target(self.joint_vel_targets)
+        
+        # For debugging
+        if self.env_step_counter % 100 == 0:
+            # Log the joint positions and velocities of the first environment
+            joint_pos = self.snake_robot.data.joint_pos[0].clone().cpu().numpy()
+            joint_vel = self.snake_robot.data.joint_vel[0].clone().cpu().numpy()
+            velocity_targets = self.joint_vel_targets[0].clone().cpu().numpy()
+            print(f"Step {self.env_step_counter}:")
+            print(f"  Joint positions: {joint_pos.round(3)}")
+            print(f"  Joint velocities: {joint_vel.round(3)}")
+            print(f"  Target velocities: {velocity_targets.round(3)}")
+            # Check actuator configuration - for debugging only
+            # Different IsaacLab versions may have different APIs, so use try/except
+            try:
+                print(f"  Actuator config from cfg: ")
+                print(f"    Damping: {self.cfg.robot.actuators['snake_joints'].damping}")
+                print(f"    Stiffness: {self.cfg.robot.actuators['snake_joints'].stiffness}")
+                print(f"    Effort limit: {self.cfg.robot.actuators['snake_joints'].effort_limit}")
+                print(f"    Velocity limit: {self.cfg.robot.actuators['snake_joints'].velocity_limit}")
+            except:
+                print("  Actuator configuration info not available")
 
     def _get_single_observation_size(self):
         """Calculate the size of a single observation (without history)."""
@@ -414,19 +437,13 @@ class SnakeEnv(DirectRLEnv):
         joint_pos = self.snake_robot.data.joint_pos
         joint_vel = self.snake_robot.data.joint_vel
         
-        # Calculate a single observation
+        # Calculate a single observation - for fixed base, only using joint data
         single_obs = torch.cat(
             (
                 # Normalized joint positions (shape: num_envs x 9)
                 torch.zeros_like(joint_pos),
                 # Scaled joint velocities (shape: num_envs x 9)
                 torch.zeros_like(joint_vel),
-                # Root position (shape: num_envs x 3)
-                torch.zeros((self.num_envs, 3), device=self.device),
-                # Root orientation (shape: num_envs x 4)
-                torch.zeros((self.num_envs, 4), device=self.device),
-                # Root linear velocity (shape: num_envs x 3)
-                torch.zeros((self.num_envs, 3), device=self.device),
             ),
             dim=-1,
         )
@@ -442,51 +459,56 @@ class SnakeEnv(DirectRLEnv):
         # Calculate joint positions normalized to [-1, 1]
         joint_pos_normalized = 2.0 * (joint_pos - self.joint_pos_lower_limits) / self.joint_pos_ranges - 1.0
         
-        # Get root state information in world frame
-        root_pos_w = self.snake_robot.data.root_pos_w
-        root_quat = self.snake_robot.data.root_quat_w
-        root_lin_vel_w = self.snake_robot.data.root_lin_vel_w
-        
-        # Convert positions from world frame to spawn-relative frame
-        # This creates a frame with origin at the robot's spawn point
-        # but the axes still align with the world frame (not rotating with the robot)
-        root_pos = root_pos_w - self.scene.env_origins
-        
-        # Use the same spawn-relative frame for velocities
-        # No rotation needed - we want to keep measuring velocity relative to the world axes
-        # just like the position
-        root_lin_vel = root_lin_vel_w  # Keep velocities in world frame orientation
-        
-        # Combine observations (current frame only)
+        # For fixed base, we only need joint positions and velocities
+        # No need for root state information since the base is fixed
         current_obs = torch.cat(
             (
                 joint_pos_normalized,   # Normalized joint positions
                 joint_vel * 0.1,        # Scaled joint velocities
-                root_pos,               # Root position (spawn-relative frame)
-                root_quat,              # Root orientation
-                root_lin_vel,           # Root linear velocity (world frame orientation)
             ),
             dim=-1,
         )
         
         # Store observation data for visualization if enabled
         if self.visualize_observations and len(self.observation_viz_data["timesteps"]) < self.max_visualization_points:
+            # Get root state for debugging/visualization even though not used in policy
+            root_pos_w = self.snake_robot.data.root_pos_w
+            root_quat = self.snake_robot.data.root_quat_w
+            root_lin_vel_w = self.snake_robot.data.root_lin_vel_w
+            
+            # Convert positions from world frame to spawn-relative frame
+            root_pos = root_pos_w - self.scene.env_origins
+            
+            # Keep velocities in world frame orientation
+            root_lin_vel = root_lin_vel_w
+            
+            # Store timestep
             self.observation_viz_data["timesteps"].append(self.sim.current_time)
+            
+            # Store joint data
             self.observation_viz_data["joint_pos"].append(joint_pos_normalized[self.visualization_env_id].clone().cpu().numpy())
             self.observation_viz_data["joint_vel"].append((joint_vel * 0.1)[self.visualization_env_id].clone().cpu().numpy())
-            self.observation_viz_data["root_pos"].append(root_pos[self.visualization_env_id].clone().cpu().numpy())
-            self.observation_viz_data["root_quat"].append(root_quat[self.visualization_env_id].clone().cpu().numpy())
-            self.observation_viz_data["root_lin_vel"].append(root_lin_vel[self.visualization_env_id].clone().cpu().numpy())
             
-            # Also store world-frame data for comparison in visualization
-            if "root_pos_w" not in self.observation_viz_data:
+            # Initialize root state storage if not already done
+            if "root_pos" not in self.observation_viz_data:
+                self.observation_viz_data["root_pos"] = []
+                self.observation_viz_data["root_quat"] = []
+                self.observation_viz_data["root_lin_vel"] = []
                 self.observation_viz_data["root_pos_w"] = []
                 self.observation_viz_data["root_lin_vel_w"] = []
                 self.observation_viz_data["env_origin"] = []
             
+            # Store root state data for debugging
+            self.observation_viz_data["root_pos"].append(root_pos[self.visualization_env_id].clone().cpu().numpy())
+            self.observation_viz_data["root_quat"].append(root_quat[self.visualization_env_id].clone().cpu().numpy())
+            self.observation_viz_data["root_lin_vel"].append(root_lin_vel[self.visualization_env_id].clone().cpu().numpy())
             self.observation_viz_data["root_pos_w"].append(root_pos_w[self.visualization_env_id].clone().cpu().numpy())
             self.observation_viz_data["root_lin_vel_w"].append(root_lin_vel_w[self.visualization_env_id].clone().cpu().numpy())
             self.observation_viz_data["env_origin"].append(self.scene.env_origins[self.visualization_env_id].clone().cpu().numpy())
+            
+            # Store flattened policy observation
+            if "flattened_policy_obs" not in self.observation_viz_data:
+                self.observation_viz_data["flattened_policy_obs"] = []
         
         if self.use_history:
             # Shift the history buffer (discard oldest, make room for newest)
@@ -504,9 +526,6 @@ class SnakeEnv(DirectRLEnv):
             if self.visualize_observations and len(self.observation_viz_data["timesteps"]) < self.max_visualization_points:
                 self.observation_viz_data["flattened_policy_obs"].append(policy_obs[self.visualization_env_id].clone().cpu().numpy())
             
-            # Optional: add observation normalization if needed
-            # policy_obs = torch.clamp(policy_obs, -10.0, 10.0)
-            
             observations = {"policy": policy_obs}
         else:
             # Just use the current observation if history is disabled
@@ -520,68 +539,44 @@ class SnakeEnv(DirectRLEnv):
 
     def _get_rewards(self) -> torch.Tensor:
         """
-        Calculate rewards using an LQR-like cost function for sidewinding.
-        Reward = state_tracking_reward - control_cost
+        Calculate rewards for fixed-base snake robot focused on position tracking.
+        Reward = position_tracking_reward - control_cost + joint_limit_penalty + alive_bonus
         """
         # Get current state information
         joint_pos = self.snake_robot.data.joint_pos
         joint_vel = self.snake_robot.data.joint_vel
         
-        # --- State tracking component ---
-        # For sidewinding, we want to track:
-        # 1. Forward velocity (x-direction)
-        # 2. Lateral velocity (y-direction) - important for sidewinding
+        # --- Position tracking component ---
+        # For fixed base control, we want to track target joint positions
+        # We'll create a sinusoidal target pattern
         
-        # Get velocities for all links in world frame
-        link_velocities_w = self.snake_robot.data.body_vel_w  # Shape: [num_envs, num_links, 6]
+        # Create time-based sinusoidal target positions
+        current_time = self.sim.current_time
+        num_joints = self.snake_robot.num_joints
         
-        # The first 3 components are linear velocity [vx, vy, vz]
-        link_linear_vels = link_velocities_w[:, :, :3]  # Extract linear velocities for all links
+        # Parameters for the oscillation pattern
+        amplitude = 0.5  # 0.5 rad amplitude
+        frequency = 0.5  # 0.5 Hz
+        phase_offset_per_joint = torch.pi / 4  # 45 degrees phase difference between joints
         
-        # Note: We keep the velocities in world coordinates (relative to fixed axes)
-        # We don't need to transform to body frame since we want to measure absolute motion
-        # This matches how velocities are used in the observation space
+        # Calculate target positions for each joint
+        target_joint_pos = torch.zeros_like(joint_pos)
+        for i in range(num_joints):
+            # Even joints use sine, odd joints use cosine for alternating pattern
+            if i % 2 == 0:
+                target_joint_pos[:, i] = amplitude * torch.sin(
+                    torch.tensor(2 * torch.pi * frequency * current_time + i * phase_offset_per_joint, device=self.device)
+                )
+            else:
+                target_joint_pos[:, i] = amplitude * torch.cos(
+                    torch.tensor(2 * torch.pi * frequency * current_time + i * phase_offset_per_joint, device=self.device)
+                )
         
-        # Target velocities for sidewinding (forward + lateral movement)
-        # Forward is along x-axis, lateral is along y-axis in world coordinates
-        target_forward_vel = torch.ones((self.num_envs,), device=self.device) * 0.5  # Target forward velocity of 0.5 m/s
-        target_lateral_vel = torch.ones((self.num_envs,), device=self.device)  # Target lateral velocity of 1 m/s (for sidewinding)
+        # Calculate position tracking error (squared difference between actual and target)
+        position_error = torch.sum((joint_pos - target_joint_pos) ** 2, dim=1)
         
-        # Extract only the tracked links' velocities
-        # First ensure the tracked indices are within range
-        num_links = link_linear_vels.shape[1]
-        valid_indices = self.tracked_link_indices[self.tracked_link_indices < num_links]
-        
-        # If no valid indices (unlikely), use the first link as fallback
-        if len(valid_indices) == 0:
-            valid_indices = torch.tensor([0], device=self.device)
-            
-        # Extract tracked link velocities (world frame orientation)
-        tracked_links_forward_vel = link_linear_vels[:, valid_indices, 0]  # [num_envs, num_tracked_links]
-        tracked_links_lateral_vel = link_linear_vels[:, valid_indices, 1]  # [num_envs, num_tracked_links]
-        
-        # Log velocities for debugging (first environment only)
-        if self.env_step_counter % 100 == 0:
-            forward_vel = tracked_links_forward_vel[0, 0].item()
-            lateral_vel = tracked_links_lateral_vel[0, 0].item()
-            # print(f"[Step {self.env_step_counter}] Link {valid_indices[0].item()} velocities:")
-            # print(f"  X velocity (forward): {forward_vel:.3f} m/s")
-            # print(f"  Y velocity (lateral): {lateral_vel:.3f} m/s")
-            # print(f"  Targets: forward={target_forward_vel[0].item():.3f}, lateral={target_lateral_vel[0].item():.3f}")
-        
-        # Calculate squared error for tracked links compared to target (broadcasting the target)
-        forward_vel_errors = (tracked_links_forward_vel - target_forward_vel.unsqueeze(1)) ** 2  # [num_envs, num_tracked_links]
-        lateral_vel_errors = (tracked_links_lateral_vel - target_lateral_vel.unsqueeze(1)) ** 2  # [num_envs, num_tracked_links]
-        
-        # Combined error for tracked links
-        combined_vel_errors = forward_vel_errors + lateral_vel_errors  # [num_envs, num_tracked_links]
-        # combined_vel_errors = lateral_vel_errors  # [num_envs, num_links]
-        
-        # Average error across tracked links for each environment
-        mean_vel_error = torch.mean(combined_vel_errors, dim=1)  # [num_envs]
-        
-        # Convert to reward using exponential (higher when error is lower)
-        state_tracking_reward = self.cfg.rew_scale_state_tracking * torch.exp(-mean_vel_error)
+        # Convert error to reward using exponential (higher when error is lower)
+        position_tracking_reward = self.cfg.rew_scale_state_tracking * torch.exp(-5.0 * position_error)
         
         # --- Control cost component ---
         # Penalize control effort (joint velocities)
@@ -598,28 +593,16 @@ class SnakeEnv(DirectRLEnv):
         alive_bonus = self.cfg.rew_scale_alive
         
         # Total reward
-        total_reward = state_tracking_reward + control_cost + joint_limit_penalty + alive_bonus
+        total_reward = position_tracking_reward + control_cost + joint_limit_penalty + alive_bonus
         
         # Log components for debugging
-        # For logging, extract mean velocities of the tracked links
-        avg_forward_vel = torch.mean(tracked_links_forward_vel, dim=1).mean().item()
-        avg_lateral_vel = torch.mean(tracked_links_lateral_vel, dim=1).mean().item()
-        
-        # Also log per-link velocities for debugging
-        tracked_vels = {}
-        for i, link_idx in enumerate(valid_indices.cpu().numpy()):
-            tracked_vels[f"link{link_idx}_forward_vel"] = tracked_links_forward_vel[:, i].mean().item()
-            tracked_vels[f"link{link_idx}_lateral_vel"] = tracked_links_lateral_vel[:, i].mean().item()
-        
         self.extras["log"] = {
-            "state_tracking_reward": state_tracking_reward.mean().item(),
-            "avg_tracked_links_forward_vel": avg_forward_vel,
-            "avg_tracked_links_lateral_vel": avg_lateral_vel,
+            "position_tracking_reward": position_tracking_reward.mean().item(),
+            "position_error": position_error.mean().item(),
             "control_cost": control_cost.mean().item(),
             "joint_limit_penalty": joint_limit_penalty.mean().item(),
             "alive_bonus": alive_bonus,
             "total_reward": total_reward.mean().item(),
-            **tracked_vels  # Add per-link velocity info
         }
         
         return total_reward
@@ -695,23 +678,14 @@ class SnakeEnv(DirectRLEnv):
         # Reset joint positions to a neutral pose with small noise
         n_envs = len(env_ids) if env_ids is not None else self.num_envs
         
-        # Start with default positions
+        # Start with default positions (all zeros)
         joint_pos = self.snake_robot.data.default_joint_pos[env_ids].clone()
         
-        # Option: Add a sinusoidal pattern as starting position
-        # This can help the robot start with a sensible snake-like posture
-        if True:
-            for i in range(self.snake_robot.num_joints):  # Fixed: use num_joints instead of action_space
-                # Phase offset to create a sinusoidal wave along the body
-                # Each joint is 90 degrees out of phase with the previous one
-                phase_offset = i * (math.pi / 2)
-                # Amplitude of the wave
-                amplitude = 0.2
-                # Apply sinusoidal pattern
-                joint_pos[:, i] = amplitude * torch.sin(torch.tensor(phase_offset))
+        # Start with all zeros - no sinusoidal pattern for stability
+        # This gives the robot a chance to stabilize from a neutral position
         
-        # Add small random noise to initial positions
-        joint_pos += torch.randn_like(joint_pos) * 0.05
+        # Add very small random noise to initial positions (reduced from 0.05)
+        joint_pos += torch.randn_like(joint_pos) * 0.01
         
         # Ensure joints are within limits
         joint_pos = torch.clamp(
@@ -725,37 +699,35 @@ class SnakeEnv(DirectRLEnv):
         
         # Reset root state
         default_root_state = self.snake_robot.data.default_root_state[env_ids].clone()
-        default_root_state[:, :3] += self.scene.env_origins[env_ids]
+        
+        # For fixed-base robots, the base position must be exactly at the environment origin
+        # Otherwise, all robots might be drawn to a common point (e.g., first robot's position)
+        for i, env_id in enumerate(env_ids):
+            default_root_state[i, :3] = self.scene.env_origins[env_id]
         
         # Write states to simulation
         self.snake_robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self.snake_robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self.snake_robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
         
-        # Reset action buffer
+        # Reset action buffer - ensure zeros for stability
         if env_ids is not None:
-            self.joint_vel_targets[env_ids] = joint_vel
-            self.prev_actions[env_ids] = joint_vel
+            self.joint_vel_targets[env_ids] = torch.zeros_like(joint_vel)
+            self.prev_actions[env_ids] = torch.zeros_like(joint_vel)
         else:
-            self.joint_vel_targets = joint_vel
-            self.prev_actions = joint_vel
+            self.joint_vel_targets = torch.zeros_like(joint_vel)
+            self.prev_actions = torch.zeros_like(joint_vel)
             
         # Reset observation history for the reset environments
         if self.use_history:
             # Get the current observation for these environments
             joint_pos_normalized = 2.0 * (joint_pos - self.joint_pos_lower_limits[env_ids]) / self.joint_pos_ranges[env_ids] - 1.0
-            root_pos = default_root_state[:, :3]
-            root_quat = default_root_state[:, 3:7]
-            root_lin_vel = torch.zeros_like(root_pos)  # Zero velocity on reset
             
-            # Create the initial observation
+            # Create the initial observation - FIXED: Removed root state components
             initial_obs = torch.cat(
                 (
                     joint_pos_normalized,   # Normalized joint positions
                     joint_vel * 0.1,        # Scaled joint velocities (zeros)
-                    root_pos,               # Root position
-                    root_quat,              # Root orientation
-                    root_lin_vel,           # Root linear velocity (zeros)
                 ),
                 dim=-1,
             )
@@ -1007,12 +979,17 @@ class SnakeEnv(DirectRLEnv):
         if not self.observation_viz_data["timesteps"]:
             print("No observation data to plot!")
             return
+        
+        # First call the specialized root position debugging plot function
+        # This will generate detailed plots for debugging root position issues
+        self.save_root_position_debug_plot()
             
         import matplotlib.pyplot as plt
         from datetime import datetime
         import os
         import numpy as np
         
+        # Continue with regular observation plots...
         # Create output directory if it doesn't exist
         output_dir = os.path.join(os.getcwd(), "observation_plots")
         os.makedirs(output_dir, exist_ok=True)
@@ -1300,4 +1277,149 @@ class SnakeEnv(DirectRLEnv):
         )
         print(f"Saved raw observation data to {raw_data_filename}")
         
+        return output_dir
+
+    # Add a specialized method just for plotting root positions to debug the current issue
+    def save_root_position_debug_plot(self):
+        """Create detailed plots specifically for debugging root position issues."""
+        print("#############################################")
+        print("Saving detailed root position debug plots")
+        print("#############################################")
+        
+        if "root_pos_w" not in self.observation_viz_data or len(self.observation_viz_data["root_pos_w"]) == 0:
+            print("No root position data to plot!")
+            return
+            
+        import matplotlib.pyplot as plt
+        from datetime import datetime
+        import os
+        import numpy as np
+        
+        # Create output directory if it doesn't exist
+        output_dir = os.path.join(os.getcwd(), "root_position_debug")
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Get timestamp for filenames
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Convert lists to numpy arrays for easier plotting
+        times = np.array(self.observation_viz_data["timesteps"])
+        root_pos_w = np.array(self.observation_viz_data["root_pos_w"])
+        env_origins = np.array(self.observation_viz_data["env_origin"])
+        
+        # Calculate position errors from expected environment origin
+        position_errors = root_pos_w - env_origins
+        error_magnitudes = np.linalg.norm(position_errors, axis=1)
+        
+        # 1. Plot Root Position Deviations in all three axes
+        fig, axes = plt.subplots(4, 1, figsize=(12, 16), sharex=True)
+        
+        # Plot X, Y, Z position deviations
+        axes[0].plot(times, position_errors[:, 0], 'r-', label='X Position Error')
+        axes[0].set_ylabel('X Error (m)')
+        axes[0].set_title(f'Root Position Error from Origin - Env {self.visualization_env_id}')
+        axes[0].grid(True)
+        axes[0].legend()
+        
+        axes[1].plot(times, position_errors[:, 1], 'g-', label='Y Position Error')
+        axes[1].set_ylabel('Y Error (m)')
+        axes[1].grid(True)
+        axes[1].legend()
+        
+        axes[2].plot(times, position_errors[:, 2], 'b-', label='Z Position Error')
+        axes[2].set_ylabel('Z Error (m)')
+        axes[2].grid(True)
+        axes[2].legend()
+        
+        # Plot total error magnitude
+        axes[3].plot(times, error_magnitudes, 'k-', label='Total Error Magnitude')
+        axes[3].set_ylabel('Error Magnitude (m)')
+        axes[3].set_xlabel('Time (s)')
+        axes[3].grid(True)
+        axes[3].legend()
+        
+        plt.tight_layout()
+        error_plot_path = os.path.join(output_dir, f'position_errors_{timestamp}.png')
+        plt.savefig(error_plot_path)
+        plt.close()
+        
+        # 2. Plot actual positions vs. environment origins
+        fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
+        
+        axes[0].plot(times, root_pos_w[:, 0], 'r-', label='Actual X Position')
+        axes[0].plot(times, env_origins[:, 0], 'r--', label='Origin X')
+        axes[0].set_ylabel('X Position (m)')
+        axes[0].set_title(f'Root Position vs Origin - Env {self.visualization_env_id}')
+        axes[0].grid(True)
+        axes[0].legend()
+        
+        axes[1].plot(times, root_pos_w[:, 1], 'g-', label='Actual Y Position')
+        axes[1].plot(times, env_origins[:, 1], 'g--', label='Origin Y')
+        axes[1].set_ylabel('Y Position (m)')
+        axes[1].grid(True)
+        axes[1].legend()
+        
+        axes[2].plot(times, root_pos_w[:, 2], 'b-', label='Actual Z Position')
+        axes[2].plot(times, env_origins[:, 2], 'b--', label='Origin Z')
+        axes[2].set_ylabel('Z Position (m)')
+        axes[2].set_xlabel('Time (s)')
+        axes[2].grid(True)
+        axes[2].legend()
+        
+        plt.tight_layout()
+        positions_plot_path = os.path.join(output_dir, f'positions_vs_origins_{timestamp}.png')
+        plt.savefig(positions_plot_path)
+        plt.close()
+        
+        # 3. Plot X-Y trajectory to see if robot is drifting
+        plt.figure(figsize=(10, 10))
+        plt.plot(root_pos_w[:, 0], root_pos_w[:, 1], 'b-', label='XY Trajectory')
+        plt.plot(env_origins[0, 0], env_origins[0, 1], 'ro', label='Environment Origin')
+        plt.plot(root_pos_w[0, 0], root_pos_w[0, 1], 'go', label='Start Position')
+        plt.plot(root_pos_w[-1, 0], root_pos_w[-1, 1], 'mo', label='End Position')
+        
+        # Add arrows to show direction of movement
+        # Add arrows every 20 points 
+        arrow_indices = np.arange(0, len(times), 20)
+        if len(arrow_indices) > 1:
+            for i in arrow_indices[:-1]:
+                plt.arrow(root_pos_w[i, 0], root_pos_w[i, 1],
+                         root_pos_w[i+1, 0] - root_pos_w[i, 0],
+                         root_pos_w[i+1, 1] - root_pos_w[i, 1],
+                         head_width=0.1, head_length=0.2, fc='k', ec='k')
+        
+        plt.xlabel('X Position (m)')
+        plt.ylabel('Y Position (m)')
+        plt.title(f'XY Trajectory - Env {self.visualization_env_id}')
+        plt.grid(True)
+        plt.axis('equal')  # Equal aspect ratio
+        plt.legend()
+        
+        trajectory_plot_path = os.path.join(output_dir, f'xy_trajectory_{timestamp}.png')
+        plt.savefig(trajectory_plot_path)
+        plt.close()
+        
+        # 4. Save additional statistics
+        stats_file_path = os.path.join(output_dir, f'position_stats_{timestamp}.txt')
+        with open(stats_file_path, 'w') as f:
+            f.write(f"Root Position Statistics - Env {self.visualization_env_id}\n")
+            f.write(f"Timestamp: {timestamp}\n\n")
+            
+            f.write("Position Error Statistics (meters):\n")
+            f.write(f"{'Axis':<5}{'Mean':<10}{'Max':<10}{'Min':<10}{'Std':<10}\n")
+            f.write(f"{'X':<5}{np.mean(position_errors[:, 0]):<10.6f}{np.max(position_errors[:, 0]):<10.6f}{np.min(position_errors[:, 0]):<10.6f}{np.std(position_errors[:, 0]):<10.6f}\n")
+            f.write(f"{'Y':<5}{np.mean(position_errors[:, 1]):<10.6f}{np.max(position_errors[:, 1]):<10.6f}{np.min(position_errors[:, 1]):<10.6f}{np.std(position_errors[:, 1]):<10.6f}\n")
+            f.write(f"{'Z':<5}{np.mean(position_errors[:, 2]):<10.6f}{np.max(position_errors[:, 2]):<10.6f}{np.min(position_errors[:, 2]):<10.6f}{np.std(position_errors[:, 2]):<10.6f}\n")
+            f.write(f"{'Mag':<5}{np.mean(error_magnitudes):<10.6f}{np.max(error_magnitudes):<10.6f}{np.min(error_magnitudes):<10.6f}{np.std(error_magnitudes):<10.6f}\n\n")
+            
+            f.write("Environment Origin:\n")
+            f.write(f"X: {env_origins[0, 0]}, Y: {env_origins[0, 1]}, Z: {env_origins[0, 2]}\n\n")
+            
+            f.write("Initial Root Position:\n")
+            f.write(f"X: {root_pos_w[0, 0]}, Y: {root_pos_w[0, 1]}, Z: {root_pos_w[0, 2]}\n\n")
+            
+            f.write("Final Root Position:\n")
+            f.write(f"X: {root_pos_w[-1, 0]}, Y: {root_pos_w[-1, 1]}, Z: {root_pos_w[-1, 2]}\n")
+        
+        print(f"Saved root position debug plots to {output_dir}")
         return output_dir
