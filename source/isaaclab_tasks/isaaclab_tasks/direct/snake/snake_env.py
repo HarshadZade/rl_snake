@@ -46,7 +46,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     robot: ArticulationCfg = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot", # Standard prim path pattern
         spawn=sim_utils.UsdFileCfg(
-            usd_path="./source/isaaclab_tasks/isaaclab_tasks/direct/snake/usd_files/snake_velocity-fixedbase.usd",
+            usd_path="./source/isaaclab_tasks/isaaclab_tasks/direct/snake/usd_files/snake_velocity-articulate-fixedjoint.usd",
             activate_contact_sensors=False, # Set to True if you need contact sensors #TODO: check this
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=False,
@@ -120,7 +120,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     class TestingCfg:
         """Configuration for testing modes."""
         # Set to True to override RL actions with manual oscillation
-        enable_manual_oscillation: bool = False
+        enable_manual_oscillation: bool = True
         
         # --- Sidewinding parameters ---
         # Amplitude in degrees (will be converted to radians)
@@ -145,7 +145,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     class PositionTrackingCfg:
         """Configuration for velocity tracking analysis."""
         enable: bool = True
-        env_id: int = 10     # Which environment to track
+        env_id: int = 0     # Which environment to track
         track_all_joints: bool = True  # Whether to track all joints or just one
         joint_id: int = 0   # Which joint to track (if not tracking all)
         max_points: int = 1000  # Maximum number of data points to collect
@@ -168,7 +168,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     class ObservationVisualizationCfg:
         """Configuration for observation visualization."""
         enable: bool = True
-        env_id: int = 10  # Which environment to visualize
+        env_id: int = 0  # Which environment to visualize
         max_points: int = 1000  # Maximum number of data points to collect
         save_interval_s: float = 10.0  # How often to save plots (seconds)
         components_to_plot: list = ["joint_pos", "joint_vel", "root_pos", "root_lin_vel", "root_pos_w"]  # Which components to plot
