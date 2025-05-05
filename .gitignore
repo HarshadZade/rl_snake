@@ -60,3 +60,8 @@ _build
 
 # Pre-Trained Checkpoints
 /.pretrained_checkpoints/
+
+# Misc
+observation_plots/*
+logs_bak/*
+joint_tracking_plots/*
