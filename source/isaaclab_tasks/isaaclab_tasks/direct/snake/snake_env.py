@@ -29,10 +29,10 @@ from isaaclab.terrains import TerrainImporter
 class SnakeEnvCfg(DirectRLEnvCfg):
     # env
     decimation = 2
-    episode_length_s = 100.0
+    episode_length_s = 50.0
     action_scale = 1.0  # rad/s - velocity control scale  #TODO: tune this
     action_space = 9    # 9 joints
-    observation_space = 28
+    observation_space = 31  # Updated: 9 (joints) + 9 (vels) + 3 (pos) + 4 (quat) + 3 (vel) + 3 (target)
     state_space = 0
     link_length = 4.0  #TODO: Get this from the USD instead of hardcoding # Length of each link in meters, used for height termination
 
@@ -40,13 +40,31 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation)
 
     # scene
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=64, env_spacing=40.0, replicate_physics=True)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=4.0, replicate_physics=True)
+
+    # -- Target Position Configuration --
+    @configclass
+    class TargetPositionCfg:
+        """Configuration for target position task."""
+        # Target position relative to the root
+        target_pos: tuple = (5, 3, 3)
+        # Which link to track for reaching the target (0 is root, higher numbers for other links)
+        tracked_link_idx: int = 9  # Default to the 9th link (adjust based on model)
+        # Scale for position-based reward
+        position_reward_scale: float = 10.0
+        # Scale for distance threshold (when to consider target reached)
+        success_distance_threshold: float = 0.5  # in meters
+        # Success bonus reward
+        success_bonus: float = 100.0
+
+    target_position: TargetPositionCfg = TargetPositionCfg()
+    # -- End Target Position Configuration --
 
     # -- Robot Configuration (Loading from USD)
     robot: ArticulationCfg = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot", # Standard prim path pattern
         spawn=sim_utils.UsdFileCfg(
-            usd_path="./source/isaaclab_tasks/isaaclab_tasks/direct/snake/usd_files/snake_velocity-articulate-fixedjoint.usd",
+            usd_path="./source/isaaclab_tasks/isaaclab_tasks/direct/snake/usd_files/snake_realistic_dim_v0.usd",
             activate_contact_sensors=False, # Set to True if you need contact sensors #TODO: check this
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=False,
@@ -71,10 +89,10 @@ class SnakeEnvCfg(DirectRLEnvCfg):
             "snake_joints": ImplicitActuatorCfg(
                 # Use regex matching your joint names, or list them
                 joint_names_expr=["joint_[1-9]"], # Example regex
-                effort_limit=100000.0,   # <<< Tune based on your robot's specs
+                effort_limit=1000.0,   # <<< Tune based on your robot's specs
                 velocity_limit=10.0,  # <<< Tune based on your robot's specs
                 stiffness=0.0,       # <<< Tune: Use >0 for position/velocity control
-                damping=100000.0,        # <<< Tune: Use >0 for position/velocity control (helps stability)
+                damping=1000.0,        # <<< Tune: Use >0 for position/velocity control (helps stability)
             ),
             # Add more actuator groups if joints have different properties
         },
@@ -104,7 +122,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     action_scale = 1.0  # rad/s - For velocity control, scale can be larger than position control
     
     # reward scales 
-    rew_scale_forward_velocity = 0.0  # Not using this in LQR approach
+    rew_scale_forward_velocity = 0.0  # Not using this in position target approach
     rew_scale_joint_vel_penalty = -0.0001  # Small penalty on joint velocities (control cost)
     rew_scale_termination = 0.0
     rew_scale_alive = 1.0  # Small alive bonus
@@ -112,8 +130,8 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     rew_scale_lateral_velocity_penalty = 0.0
     rew_scale_joint_limit_penalty = -5.0  # Keep joint limit penalty
     
-    # LQR reward parameters
-    rew_scale_state_tracking = 10.0  # Weight for state tracking term
+    # Position target reward parameters
+    rew_scale_target_distance = 10.0  # Weight for target distance tracking term
     rew_scale_control_cost = -0.001  # Weight for control cost term
     
     # --- ADD TESTING CONFIGURATION ---
@@ -145,7 +163,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     @configclass
     class PositionTrackingCfg:
         """Configuration for velocity tracking analysis."""
-        enable: bool = True
+        enable: bool = False
         env_id: int = 0     # Which environment to track
         track_all_joints: bool = True  # Whether to track all joints or just one
         joint_id: int = 0   # Which joint to track (if not tracking all)
@@ -168,11 +186,12 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     @configclass
     class ObservationVisualizationCfg:
         """Configuration for observation visualization."""
-        enable: bool = True
+        enable: bool = False
         env_id: int = 0  # Which environment to visualize
         max_points: int = 1000  # Maximum number of data points to collect
         save_interval_s: float = 10.0  # How often to save plots (seconds)
-        components_to_plot: list = ["joint_pos", "joint_vel", "root_pos", "root_lin_vel"]  # Which components to plot
+        # Include all components by default
+        components_to_plot: list = ["joint_pos", "joint_vel", "root_pos", "root_lin_vel", "root_quat", "flattened_policy_obs"]
     
     observation_visualization: ObservationVisualizationCfg = ObservationVisualizationCfg()
     # --- END OBSERVATION VISUALIZATION CONFIG ---
@@ -182,43 +201,37 @@ class SnakeEnv(DirectRLEnv):
 
     def __init__(self, cfg: SnakeEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
+        self._render = render_mode is not None
         
         self.action_scale = self.cfg.action_scale
         self.env_step_counter = 0
-        #TODO: Need to make sure all the required information is used and set here!!
-        # Currently its just some random stuff!
         
-        self.track_positions = self.cfg.position_tracking.enable # Use the flag from config
+        # Define which link to track for target reaching
+        self.tracked_link_idx = torch.tensor([self.cfg.target_position.tracked_link_idx], device=self.device)
+        
+        # Store target position
+        self.target_position = torch.tensor(self.cfg.target_position.target_pos, device=self.device)
+        
+        # Add a buffer to track whether each environment has reached the target
+        self.target_reached = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        
+        # Track closest distance to target for each environment (initialize with large value)
+        self.closest_distance = torch.ones(self.num_envs, device=self.device) * 100.0
+        
+        # Print debug info about links at the first step
+        self.printed_link_debug = False
+        
+        self.track_positions = self.cfg.position_tracking.enable
         if self.track_positions:
             self.tracking_env_id = self.cfg.position_tracking.env_id
             self.tracking_joint_id = self.cfg.position_tracking.joint_id
             self.track_all_joints = self.cfg.position_tracking.track_all_joints
             self.max_tracking_points = self.cfg.position_tracking.max_points
             
-            # Initialize velocity tracking data structure 
-            self.position_tracking_data = {
-                "timesteps": [],
-                "commanded_velocities": [],
-                "actual_velocities": [],
-            }
-            
             if self.track_all_joints:
                 print(f"[Info] Velocity tracking enabled for all joints in Env {self.tracking_env_id}.")
             else:
                 print(f"[Info] Velocity tracking enabled for Env {self.tracking_env_id}, Joint {self.tracking_joint_id}.")
-            print(f"       Plots will be saved when you terminate the simulation (Ctrl+C).")
-            
-            # Set up signal handler for SIGINT (Ctrl+C)
-            import signal
-            def signal_handler(sig, frame):
-                print("\nCaught interrupt signal. Saving velocity tracking plot before exiting...")
-                self.save_position_tracking_plot()
-                print("Plot saved. Exiting...")
-                import sys
-                sys.exit(0)
-            
-            # Register the signal handler for SIGINT
-            signal.signal(signal.SIGINT, signal_handler)
         
         # --- Initialize observation history ---
         self.use_history = self.cfg.observation_history.enable
@@ -235,50 +248,8 @@ class SnakeEnv(DirectRLEnv):
                 (self.num_envs, self.history_length, single_obs_size), 
                 device=self.device
             )
-        # --- End observation history initialization ---
         
-        # --- Initialize observation visualization ---
-        self.visualize_observations = self.cfg.observation_visualization.enable
-        if self.visualize_observations:
-            self.visualization_env_id = self.cfg.observation_visualization.env_id
-            self.max_visualization_points = self.cfg.observation_visualization.max_points
-            self.components_to_plot = self.cfg.observation_visualization.components_to_plot
-            
-            # Initialize data structure for observation visualization
-            self.observation_viz_data = {
-                "timesteps": [],
-                "joint_pos": [],
-                "joint_vel": [],
-                "root_pos": [],
-                "root_quat": [],
-                "root_lin_vel": [],
-                "flattened_policy_obs": [],  # Store the flattened policy observation for verification
-            }
-            
-            print(f"[Info] Observation visualization enabled for Env {self.visualization_env_id}.")
-            print(f"       Components being tracked: {self.components_to_plot}")
-            print(f"       Plots will be saved when you terminate the simulation (Ctrl+C).")
-            
-            # Extend the signal handler to also save observation plots
-            import signal
-            original_sigint_handler = signal.getsignal(signal.SIGINT)
-            
-            def extended_signal_handler(sig, frame):
-                print("\nCaught interrupt signal. Saving observation visualization plots before exiting...")
-                self.save_observation_plots()
-                
-                # Call the original handler if it exists
-                if callable(original_sigint_handler):
-                    original_sigint_handler(sig, frame)
-                else:
-                    print("Exiting...")
-                    import sys
-                    sys.exit(0)
-            
-            # Register the extended signal handler
-            signal.signal(signal.SIGINT, extended_signal_handler)
-        # --- End observation visualization initialization ---
- 
+        # Initialize joint position limits
         self.joint_pos_limits = self.snake_robot.data.soft_joint_pos_limits
         self.joint_pos_lower_limits = self.joint_pos_limits[..., 0].to(self.device) # Ellipsis (...) means all preceding dims
         self.joint_pos_upper_limits = self.joint_pos_limits[..., 1].to(self.device)
@@ -316,9 +287,10 @@ class SnakeEnv(DirectRLEnv):
         # add lights
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
-
+        
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self.env_step_counter += 1
+        
         # Store action for smoothness calculations in reward
         self.prev_actions = self.joint_vel_targets.clone()
         
@@ -365,21 +337,6 @@ class SnakeEnv(DirectRLEnv):
             # Expand to all environments
             self.joint_vel_targets[:] = velocity_targets.unsqueeze(0).expand(self.num_envs, -1)
             
-            # Print debug info occasionally
-            if self.env_step_counter % 20 == 0:
-                # print(f"Step: {self.env_step_counter}, Time: {current_time:.4f}")
-                # print(f"Vel targets (first 3 joints, rad/s): {velocity_targets[:3].cpu().numpy().round(4)}")
-                
-                # Optional: Calculate and print expected positions (integral of velocity)
-                positions = []
-                for i in range(min(3, num_joints)):  # First 3 joints
-                    if i % 2 == 0:  # Even joints
-                        pos = amplitude_x_rad * torch.sin(torch.tensor(omega_x * current_time + i * delta_x))
-                    else:  # Odd joints
-                        pos = amplitude_y_rad * torch.sin(torch.tensor(omega_y * current_time + i * delta_y + phi))
-                    positions.append(pos.item())
-                # print(f"Expected pos (first 3 joints, rad): {np.array(positions).round(4)}")
-                    
             # Set self.actions for potential use in reward calculations
             self.actions = torch.zeros_like(actions)
             
@@ -418,6 +375,8 @@ class SnakeEnv(DirectRLEnv):
                 torch.zeros((self.num_envs, 4), device=self.device),
                 # Root linear velocity (shape: num_envs x 3)
                 torch.zeros((self.num_envs, 3), device=self.device),
+                # Target position (shape: num_envs x 3)
+                torch.zeros((self.num_envs, 3), device=self.device),
             ),
             dim=-1,
         )
@@ -439,8 +398,6 @@ class SnakeEnv(DirectRLEnv):
         root_lin_vel_w = self.snake_robot.data.root_lin_vel_w
         
         # Convert positions from world frame to spawn-relative frame
-        # This creates a frame with origin at the robot's spawn point
-        # but the axes still align with the world frame (not rotating with the robot)
         root_pos = root_pos_w - self.scene.env_origins
         
         # Use the same spawn-relative frame for velocities
@@ -448,7 +405,11 @@ class SnakeEnv(DirectRLEnv):
         # just like the position
         root_lin_vel = root_lin_vel_w  # Keep velocities in world frame orientation
         
-        # Combine observations (current frame only)
+        # Calculate target position relative to the robot's current position
+        # This helps the robot understand where the target is in its local frame
+        target_pos_relative = self.target_position.unsqueeze(0).expand(self.num_envs, -1)
+        
+        # Combine observations (current frame only) including target position
         current_obs = torch.cat(
             (
                 joint_pos_normalized,   # Normalized joint positions
@@ -456,28 +417,10 @@ class SnakeEnv(DirectRLEnv):
                 root_pos,               # Root position (spawn-relative frame)
                 root_quat,              # Root orientation
                 root_lin_vel,           # Root linear velocity (world frame orientation)
+                target_pos_relative,    # Target position (relative to root)
             ),
             dim=-1,
         )
-        
-        # Store observation data for visualization if enabled
-        if self.visualize_observations and len(self.observation_viz_data["timesteps"]) < self.max_visualization_points:
-            self.observation_viz_data["timesteps"].append(self.sim.current_time)
-            self.observation_viz_data["joint_pos"].append(joint_pos_normalized[self.visualization_env_id].clone().cpu().numpy())
-            self.observation_viz_data["joint_vel"].append((joint_vel * 0.1)[self.visualization_env_id].clone().cpu().numpy())
-            self.observation_viz_data["root_pos"].append(root_pos[self.visualization_env_id].clone().cpu().numpy())
-            self.observation_viz_data["root_quat"].append(root_quat[self.visualization_env_id].clone().cpu().numpy())
-            self.observation_viz_data["root_lin_vel"].append(root_lin_vel[self.visualization_env_id].clone().cpu().numpy())
-            
-            # Also store world-frame data for comparison in visualization
-            if "root_pos_w" not in self.observation_viz_data:
-                self.observation_viz_data["root_pos_w"] = []
-                self.observation_viz_data["root_lin_vel_w"] = []
-                self.observation_viz_data["env_origin"] = []
-            
-            self.observation_viz_data["root_pos_w"].append(root_pos_w[self.visualization_env_id].clone().cpu().numpy())
-            self.observation_viz_data["root_lin_vel_w"].append(root_lin_vel_w[self.visualization_env_id].clone().cpu().numpy())
-            self.observation_viz_data["env_origin"].append(self.scene.env_origins[self.visualization_env_id].clone().cpu().numpy())
         
         if self.use_history:
             # Shift the history buffer (discard oldest, make room for newest)
@@ -491,89 +434,62 @@ class SnakeEnv(DirectRLEnv):
             # to [num_envs, history_length * single_obs_size]
             policy_obs = self.obs_history.reshape(self.num_envs, -1)
             
-            # Store the flattened policy observation for visualization
-            if self.visualize_observations and len(self.observation_viz_data["timesteps"]) < self.max_visualization_points:
-                self.observation_viz_data["flattened_policy_obs"].append(policy_obs[self.visualization_env_id].clone().cpu().numpy())
-            
-            # Optional: add observation normalization if needed
-            # policy_obs = torch.clamp(policy_obs, -10.0, 10.0)
-            
             observations = {"policy": policy_obs}
         else:
             # Just use the current observation if history is disabled
             observations = {"policy": current_obs}
-            
-            # Store the policy observation for visualization
-            if self.visualize_observations and len(self.observation_viz_data["timesteps"]) < self.max_visualization_points:
-                self.observation_viz_data["flattened_policy_obs"].append(current_obs[self.visualization_env_id].clone().cpu().numpy())
         
         return observations
 
     def _get_rewards(self) -> torch.Tensor:
         """
-        Calculate rewards using an LQR-like cost function for sidewinding.
-        Reward = state_tracking_reward - control_cost
+        Calculate rewards based on distance to target position.
+        Reward structure:
+        1. Negative exponential of distance to target (closer = higher reward)
+        2. Success bonus for reaching the target
+        3. Control cost for joint velocities
+        4. Joint limit penalties for safety
         """
         # Get current state information
         joint_pos = self.snake_robot.data.joint_pos
         joint_vel = self.snake_robot.data.joint_vel
         energy_penalty = self.cfg.rew_scale_joint_vel_penalty * torch.sum(joint_vel**2, dim=1)
         
-        # --- State tracking component ---
-        # For sidewinding, we want to track:
-        # 1. Forward velocity (x-direction)
-        # 2. Lateral velocity (y-direction) - important for sidewinding
+        # --- Target distance component ---
+        # Get root position in world frame
+        root_pos_w = self.snake_robot.data.root_pos_w  # [num_envs, 3]
         
-        # Get velocities for all links in world frame
-        link_velocities_w = self.snake_robot.data.body_vel_w  # Shape: [num_envs, num_links, 6]
+        # Get tracked link position (for reaching the target)
+        link_positions_w = self.snake_robot.data.body_pos_w  # Shape: [num_envs, num_links, 3]
         
-        # The first 3 components are linear velocity [vx, vy, vz]
-        link_linear_vels = link_velocities_w[:, :, :3]  # Extract linear velocities for all links
+        # Ensure tracked link index is valid
+        num_links = link_positions_w.shape[1]
+        tracked_idx = torch.clamp(self.tracked_link_idx, 0, num_links - 1)[0]
         
-        # Note: We keep the velocities in world coordinates (relative to fixed axes)
-        # We don't need to transform to body frame since we want to measure absolute motion
-        # This matches how velocities are used in the observation space
+        # Get the position of the tracked link
+        tracked_link_pos = link_positions_w[:, tracked_idx]  # [num_envs, 3]
         
-        # Target velocities for sidewinding (forward + lateral movement)
-        # Forward is along x-axis, lateral is along y-axis in world coordinates
-        target_forward_vel = torch.ones((self.num_envs,), device=self.device) * 0.5  # Target forward velocity of 0.5 m/s
-        target_lateral_vel = torch.ones((self.num_envs,), device=self.device)  # Target lateral velocity of 1 m/s (for sidewinding)
+        # Calculate target position in world frame for each environment
+        target_pos_w = root_pos_w + self.target_position.unsqueeze(0)  # [num_envs, 3]
         
-        # Extract only the tracked links' velocities
-        # First ensure the tracked indices are within range
-        num_links = link_linear_vels.shape[1]
-        valid_indices = self.tracked_link_indices[self.tracked_link_indices < num_links]
+        # Calculate distance to target
+        distance_to_target = torch.norm(tracked_link_pos - target_pos_w, dim=1)  # [num_envs]
         
-        # If no valid indices (unlikely), use the first link as fallback
-        if len(valid_indices) == 0:
-            valid_indices = torch.tensor([0], device=self.device)
-            
-        # Extract tracked link velocities (world frame orientation)
-        tracked_links_forward_vel = link_linear_vels[:, valid_indices, 0]  # [num_envs, num_tracked_links]
-        tracked_links_lateral_vel = link_linear_vels[:, valid_indices, 1]  # [num_envs, num_tracked_links]
+        # Update closest distance tracker
+        self.closest_distance = torch.minimum(self.closest_distance, distance_to_target)
         
-        # Log velocities for debugging (first environment only)
-        if self.env_step_counter % 100 == 0:
-            forward_vel = tracked_links_forward_vel[0, 0].item()
-            lateral_vel = tracked_links_lateral_vel[0, 0].item()
-            # print(f"[Step {self.env_step_counter}] Link {valid_indices[0].item()} velocities:")
-            # print(f"  X velocity (forward): {forward_vel:.3f} m/s")
-            # print(f"  Y velocity (lateral): {lateral_vel:.3f} m/s")
-            # print(f"  Targets: forward={target_forward_vel[0].item():.3f}, lateral={target_lateral_vel[0].item():.3f}")
+        # Check if target reached (within threshold)
+        threshold = self.cfg.target_position.success_distance_threshold
+        newly_reached = (distance_to_target < threshold) & (~self.target_reached)
+        self.target_reached = self.target_reached | newly_reached
         
-        # Calculate squared error for tracked links compared to target (broadcasting the target)
-        forward_vel_errors = (tracked_links_forward_vel - target_forward_vel.unsqueeze(1)) ** 2  # [num_envs, num_tracked_links]
-        lateral_vel_errors = (tracked_links_lateral_vel - target_lateral_vel.unsqueeze(1)) ** 2  # [num_envs, num_tracked_links]
+        # Calculate distance-based reward (exponential of negative distance)
+        # This gives higher reward as robot gets closer to target
+        distance_reward = self.cfg.rew_scale_target_distance * torch.exp(-distance_to_target)
         
-        # Combined error for tracked links
-        combined_vel_errors = forward_vel_errors + lateral_vel_errors  # [num_envs, num_tracked_links]
-        # combined_vel_errors = lateral_vel_errors  # [num_envs, num_links]
-        
-        # Average error across tracked links for each environment
-        mean_vel_error = torch.mean(combined_vel_errors, dim=1)  # [num_envs]
-        
-        # Convert to reward using exponential (higher when error is lower)
-        state_tracking_reward = self.cfg.rew_scale_state_tracking * torch.exp(-mean_vel_error)
+        # Add success bonus for environments that just reached the target
+        success_bonus = torch.zeros_like(distance_reward)
+        success_bonus[newly_reached] = self.cfg.target_position.success_bonus
         
         # --- Control cost component ---
         # Penalize control effort (joint velocities)
@@ -590,28 +506,19 @@ class SnakeEnv(DirectRLEnv):
         alive_bonus = self.cfg.rew_scale_alive
         
         # Total reward
-        total_reward = state_tracking_reward + control_cost + joint_limit_penalty + alive_bonus
+        total_reward = distance_reward + success_bonus + control_cost + joint_limit_penalty + alive_bonus
         
         # Log components for debugging
-        # For logging, extract mean velocities of the tracked links
-        avg_forward_vel = torch.mean(tracked_links_forward_vel, dim=1).mean().item()
-        avg_lateral_vel = torch.mean(tracked_links_lateral_vel, dim=1).mean().item()
-        
-        # Also log per-link velocities for debugging
-        tracked_vels = {}
-        for i, link_idx in enumerate(valid_indices.cpu().numpy()):
-            tracked_vels[f"link{link_idx}_forward_vel"] = tracked_links_forward_vel[:, i].mean().item()
-            tracked_vels[f"link{link_idx}_lateral_vel"] = tracked_links_lateral_vel[:, i].mean().item()
-        
         self.extras["log"] = {
-            "state_tracking_reward": state_tracking_reward.mean().item(),
-            "avg_tracked_links_forward_vel": avg_forward_vel,
-            "avg_tracked_links_lateral_vel": avg_lateral_vel,
+            "distance_to_target": distance_to_target.mean().item(),
+            "closest_distance": self.closest_distance.mean().item(),
+            "distance_reward": distance_reward.mean().item(),
+            "success_bonus": success_bonus.mean().item(),
+            "targets_reached": torch.sum(self.target_reached).item(),
             "control_cost": control_cost.mean().item(),
             "joint_limit_penalty": joint_limit_penalty.mean().item(),
             "alive_bonus": alive_bonus,
             "total_reward": total_reward.mean().item(),
-            **tracked_vels  # Add per-link velocity info
         }
         
         return total_reward
@@ -644,8 +551,8 @@ class SnakeEnv(DirectRLEnv):
         
         # Get joint position bounds check
         self.joint_pos = self.snake_robot.data.joint_pos
-        out_of_bounds = torch.any(self.joint_pos < self.joint_pos_lower_limits + 0.524, dim=1) | \
-                        torch.any(self.joint_pos > self.joint_pos_upper_limits - 0.524, dim=1) #1.57-0.524 rad = 60 deg. restricting the max angles 
+        out_of_bounds = torch.any(self.joint_pos < self.joint_pos_lower_limits, dim=1) | \
+                        torch.any(self.joint_pos > self.joint_pos_upper_limits, dim=1) #1.57-0.524 rad = 60 deg. restricting the max angles 
         
         # Get body position world coordinates
         body_pos_w = self.snake_robot.data.body_pos_w  # Shape: [num_envs, num_links, 3]
@@ -660,19 +567,6 @@ class SnakeEnv(DirectRLEnv):
         
         terminated = out_of_bounds 
         
-        # Add logging information for debugging
-        if self.env_step_counter % 100 == 0:  # Only log occasionally to avoid overhead
-            num_too_high = torch.sum(too_high).item()
-            if num_too_high > 0:
-                # print(f"[Step {self.env_step_counter}] Terminating {num_too_high} environments due to links being too high")
-                
-                # For the first environment with high links, log details about which links are too high
-                if too_high[0]:
-                    first_env_heights = link_heights[0]
-                    high_links = (first_env_heights > self.cfg.link_length).nonzero().flatten()
-                    high_link_heights = first_env_heights[high_links]
-                    # print(f"  Env 0: Links {high_links.cpu().numpy()} are too high with heights {high_link_heights.cpu().numpy()}")
-        
         # Add termination reason info to extras
         if "episode" not in self.extras:
             self.extras["episode"] = {}
@@ -686,6 +580,14 @@ class SnakeEnv(DirectRLEnv):
         if env_ids is None:
             env_ids = []  # Use empty list instead of tensor to avoid type error
         super()._reset_idx(env_ids)
+        
+        # Reset target reached status for reset environments
+        if len(env_ids) > 0:
+            self.target_reached[env_ids] = False
+            self.closest_distance[env_ids] = torch.ones(len(env_ids), device=self.device) * 100.0
+        else:
+            self.target_reached = torch.zeros_like(self.target_reached)
+            self.closest_distance = torch.ones_like(self.closest_distance) * 100.0
         
         # Reset joint positions to a neutral pose with small noise
         n_envs = len(env_ids) if env_ids is not None else self.num_envs
@@ -731,9 +633,6 @@ class SnakeEnv(DirectRLEnv):
         if env_ids is not None:
             self.joint_vel_targets[env_ids] = joint_vel
             self.prev_actions[env_ids] = joint_vel
-        else:
-            self.joint_vel_targets = joint_vel
-            self.prev_actions = joint_vel
             
         # Reset observation history for the reset environments
         if self.use_history:
@@ -743,7 +642,10 @@ class SnakeEnv(DirectRLEnv):
             root_quat = default_root_state[:, 3:7]
             root_lin_vel = torch.zeros_like(root_pos)  # Zero velocity on reset
             
-            # Create the initial observation
+            # Include target position in the observation
+            target_pos_relative = self.target_position.unsqueeze(0).expand(len(env_ids), -1)
+            
+            # Create the initial observation with target position included
             initial_obs = torch.cat(
                 (
                     joint_pos_normalized,   # Normalized joint positions
@@ -751,6 +653,7 @@ class SnakeEnv(DirectRLEnv):
                     root_pos,               # Root position
                     root_quat,              # Root orientation
                     root_lin_vel,           # Root linear velocity (zeros)
+                    target_pos_relative,    # Target position relative to root
                 ),
                 dim=-1,
             )
@@ -762,537 +665,95 @@ class SnakeEnv(DirectRLEnv):
 
     # --- Override the step method ---
     def step(self, actions: torch.Tensor) -> tuple[dict, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-        """Override the main environment step to collect plotting data."""
-
-        # Before taking the step, record the current time and commanded velocity
-        current_time = self.sim.current_time
+        # Get observations before stepping
+        obs_dict = self._get_observations()
         
-        # Store commanded velocities before physics step if tracking is enabled
-        if self.track_positions and len(self.position_tracking_data["timesteps"]) < self.max_tracking_points:
-            if self.track_all_joints:
-                # Store commanded velocities for all joints in selected environment
-                commanded_velocities = self.joint_vel_targets[self.tracking_env_id].clone().cpu().numpy()
-            else:
-                # Store just the single joint's commanded velocity
-                commanded_velocities = self.joint_vel_targets[self.tracking_env_id, self.tracking_joint_id].item()
-
-        # --- Call the original DirectRLEnv step logic ---
-        # This handles: _pre_physics_step, sim.step(), _get_observations, _get_rewards, _get_dones, _reset_idx etc.
-        obs_dict, rew, terminated, truncated, extras = super().step(actions)
-        # --- End original step logic ---
-
-        # --- Collect BOTH commanded and actual velocity data AFTER physics step ---
-        if self.track_positions and len(self.position_tracking_data["timesteps"]) < self.max_tracking_points:
-            if self.track_all_joints:
-                # Get actual joint velocities for all joints after the physics step
-                actual_velocities = self.snake_robot.data.joint_vel[self.tracking_env_id].clone().cpu().numpy()
-                
-                # Debug: print collection info occasionally
-                if self.env_step_counter % 100 == 0:
-                    print(f"Collecting data point {len(self.position_tracking_data['timesteps'])} at time {self.sim.current_time:.2f}s")
-            else:
-                # Get single joint's actual velocity after the physics step
-                actual_velocities = self.snake_robot.data.joint_vel[self.tracking_env_id, self.tracking_joint_id].item()
-                
-                # Debug: print collection info occasionally
-                if self.env_step_counter % 100 == 0:
-                    print(f"Collecting data point {len(self.position_tracking_data['timesteps'])} at time {self.sim.current_time:.2f}s")
-                    print(f"  Commanded velocity: {commanded_velocities:.4f}, Actual velocity: {actual_velocities:.4f}")
+        # Apply actions
+        self._pre_physics_step(actions)
+        
+        # Step physics
+        for _ in range(self.cfg.decimation):
+            self.sim.step(render=self._render)
+            self.sim.render()
+        
+        # Get observations after stepping
+        obs_dict = self._get_observations()
+        
+        # Get rewards and dones
+        rew = self._get_rewards()
+        terminated, truncated = self._get_dones()
+        
+        # Initialize extras if not present
+        if "log" not in self.extras:
+            self.extras["log"] = dict()
             
-            # Save both data points
-            self.position_tracking_data["timesteps"].append(current_time)
-            self.position_tracking_data["commanded_velocities"].append(commanded_velocities)
-            self.position_tracking_data["actual_velocities"].append(actual_velocities)
-
-        return obs_dict, rew, terminated, truncated, extras
+        # Log tracking data if enabled
+        if self.cfg.position_tracking.enable:
+            env_id = self.cfg.position_tracking.env_id
+            if self.track_all_joints:
+                # Log commanded and actual velocities for each joint
+                for joint_idx in range(self.snake_robot.num_joints):
+                    self.extras["log"][f"Tracking/Joint{joint_idx}/CommandedVelocity"] = self.joint_vel_targets[env_id, joint_idx].item()
+                    self.extras["log"][f"Tracking/Joint{joint_idx}/ActualVelocity"] = self.snake_robot.data.joint_vel[env_id, joint_idx].item()
+                    
+                    # Calculate and log error metrics
+                    error = self.joint_vel_targets[env_id, joint_idx] - self.snake_robot.data.joint_vel[env_id, joint_idx]
+                    self.extras["log"][f"Tracking/Joint{joint_idx}/Error"] = error.item()
+                    self.extras["log"][f"Tracking/Joint{joint_idx}/AbsError"] = abs(error.item())
+            else:
+                joint_idx = self.cfg.position_tracking.joint_id
+                self.extras["log"][f"Tracking/Joint{joint_idx}/CommandedVelocity"] = self.joint_vel_targets[env_id, joint_idx].item()
+                self.extras["log"][f"Tracking/Joint{joint_idx}/ActualVelocity"] = self.snake_robot.data.joint_vel[env_id, joint_idx].item()
+                error = self.joint_vel_targets[env_id, joint_idx] - self.snake_robot.data.joint_vel[env_id, joint_idx]
+                self.extras["log"][f"Tracking/Joint{joint_idx}/Error"] = error.item()
+                self.extras["log"][f"Tracking/Joint{joint_idx}/AbsError"] = abs(error.item())
+        
+        # Log observation data if enabled
+        if self.cfg.observation_visualization.enable:
+            env_id = self.cfg.observation_visualization.env_id
+            
+            # Log joint positions and velocities
+            if "joint_pos" in self.cfg.observation_visualization.components_to_plot:
+                for joint_idx in range(self.snake_robot.num_joints):
+                    self.extras["log"][f"Observations/Joint{joint_idx}/Position"] = self.snake_robot.data.joint_pos[env_id, joint_idx].item()
+            
+            if "joint_vel" in self.cfg.observation_visualization.components_to_plot:
+                for joint_idx in range(self.snake_robot.num_joints):
+                    self.extras["log"][f"Observations/Joint{joint_idx}/Velocity"] = self.snake_robot.data.joint_vel[env_id, joint_idx].item()
+            
+            # Log root position (world and local frame)
+            if "root_pos" in self.cfg.observation_visualization.components_to_plot:
+                # World frame position
+                for i, axis in enumerate(['X', 'Y', 'Z']):
+                    self.extras["log"][f"Observations/Root/WorldPosition{axis}"] = self.snake_robot.data.root_pos_w[env_id, i].item()
+                    self.extras["log"][f"Observations/Root/LocalPosition{axis}"] = self.snake_robot.data.root_link_pos_w[env_id, i].item()
+            
+            # Log root linear velocity
+            if "root_lin_vel" in self.cfg.observation_visualization.components_to_plot:
+                for i, axis in enumerate(['X', 'Y', 'Z']):
+                    self.extras["log"][f"Observations/Root/LinearVelocity{axis}"] = self.snake_robot.data.root_lin_vel_w[env_id, i].item()
+            
+            # Log root orientation (quaternion)
+            if "root_quat" in self.cfg.observation_visualization.components_to_plot:
+                for i, component in enumerate(['W', 'X', 'Y', 'Z']):
+                    self.extras["log"][f"Observations/Root/Quaternion{component}"] = self.snake_robot.data.root_quat_w[env_id, i].item()
+            
+            # Log flattened policy observation
+            if "flattened_policy_obs" in self.cfg.observation_visualization.components_to_plot:
+                if self.use_history:
+                    policy_obs = self.obs_history[env_id].reshape(-1)  # Flatten the history for the selected environment
+                else:
+                    policy_obs = obs_dict["policy"][env_id]  # Get the policy observation for the selected environment
+                
+                # Log each dimension of the policy observation
+                for i in range(len(policy_obs)):
+                    self.extras["log"][f"Observations/PolicyObs/Dim{i}"] = policy_obs[i].item()
+        
+        return obs_dict, rew, terminated, truncated, self.extras
     # --- End override ---
     
     def save_position_tracking_plot(self):
-        print("#############################################")
-        print("Saving velocity tracking plot")
-        print("#############################################")
-        
-        # Save the tracking data to a file
-        if not self.position_tracking_data["timesteps"]:
-            print("No velocity tracking data to plot!")
-            return
-            
-        import matplotlib.pyplot as plt
-        from datetime import datetime
-        import os
-        
-        # Create output directory if it doesn't exist
-        output_dir = os.path.join(os.getcwd(), "joint_tracking_plots")
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Get timestamp for filenames
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # Get number of collected datapoints
-        timesteps_count = len(self.position_tracking_data["timesteps"])
-        
-        if self.track_all_joints:
-            # For multi-joint tracking
-            
-            # Convert data to numpy arrays for plotting
-            times = np.array(self.position_tracking_data["timesteps"])
-            
-            # Number of joints
-            num_joints = self.snake_robot.num_joints
-            
-            print(f"Plotting data: timesteps={timesteps_count}, joints={num_joints}")
-            
-            # Setup the plot - one figure with subplots for each joint
-            fig, axes = plt.subplots(num_joints, 1, figsize=(12, 3*num_joints), sharex=True)
-            
-            # Create arrays to store error metrics
-            rmse_values = np.zeros(num_joints)
-            max_error_values = np.zeros(num_joints)
-            avg_error_values = np.zeros(num_joints)
-            
-            # Extract data for each joint and plot
-            for joint_idx in range(num_joints):
-                # Extract data for this joint
-                commanded = np.array([cmd[joint_idx] for cmd in self.position_tracking_data["commanded_velocities"]])
-                actual = np.array([act[joint_idx] for act in self.position_tracking_data["actual_velocities"]])
-                
-                # Plot on the corresponding subplot
-                ax = axes[joint_idx]
-                ax.plot(times, commanded, 'b-', label='Commanded')
-                ax.plot(times, actual, 'r-', label='Actual')
-                
-                # Calculate error metrics for this joint
-                error = commanded - actual
-                rmse_values[joint_idx] = np.sqrt(np.mean(np.square(error)))
-                max_error_values[joint_idx] = np.max(np.abs(error))
-                avg_error_values[joint_idx] = np.mean(np.abs(error))
-                
-                # Add metrics to the plot
-                ax.text(0.02, 0.85, 
-                      f'RMSE: {rmse_values[joint_idx]:.4f} rad/s\nMax Err: {max_error_values[joint_idx]:.4f} rad/s\nAvg Err: {avg_error_values[joint_idx]:.4f} rad/s',
-                      transform=ax.transAxes,
-                      bbox={'facecolor': 'white', 'alpha': 0.8, 'pad': 5})
-                
-                # Add labels and legend
-                ax.set_ylabel(f'Joint {joint_idx} (rad/s)')
-                ax.set_title(f'Joint {joint_idx} Velocity Tracking')
-                ax.grid(True)
-                if joint_idx == 0:
-                    ax.legend(loc='upper right')
-            
-            # Common labels
-            axes[-1].set_xlabel('Time (s)')
-            fig.suptitle(f'Joint Velocity Tracking - All Joints in Env {self.tracking_env_id}')
-            plt.tight_layout()
-            
-            # Save the multi-joint plot
-            filename = os.path.join(output_dir, f'all_joints_velocity_tracking_env{self.tracking_env_id}_{timestamp}.png')
-            plt.savefig(filename)
-            plt.close()
-            
-            # Save a summary of the error metrics
-            summary_filename = os.path.join(output_dir, f'velocity_tracking_metrics_summary_{timestamp}.txt')
-            with open(summary_filename, 'w') as f:
-                f.write(f"Joint Velocity Tracking Metrics Summary - Env {self.tracking_env_id}\n")
-                f.write(f"Timestamp: {timestamp}\n\n")
-                f.write(f"{'Joint':<10}{'RMSE (rad/s)':<15}{'Max Error (rad/s)':<20}{'Avg Error (rad/s)':<20}\n")
-                f.write("-" * 65 + "\n")
-                for i in range(num_joints):
-                    f.write(f"{i:<10}{rmse_values[i]:<15.4f}{max_error_values[i]:<20.4f}{avg_error_values[i]:<20.4f}\n")
-                
-                # Add averages across all joints
-                f.write("-" * 65 + "\n")
-                f.write(f"{'Average':<10}{np.mean(rmse_values):<15.4f}{np.mean(max_error_values):<20.4f}{np.mean(avg_error_values):<20.4f}\n")
-            
-            # Optional: Save the raw data as CSV for all joints
-            # Create a header for the CSV file
-            header = 'time'
-            for i in range(num_joints):
-                header += f',cmd_vel_joint{i},act_vel_joint{i}'
-            
-            # Create the data array for CSV
-            csv_data = np.zeros((len(times), 1 + 2*num_joints))
-            csv_data[:, 0] = times
-            
-            for t in range(len(times)):
-                for j in range(num_joints):
-                    csv_data[t, 1 + 2*j] = self.position_tracking_data["commanded_velocities"][t][j]
-                    csv_data[t, 2 + 2*j] = self.position_tracking_data["actual_velocities"][t][j]
-            
-            csv_filename = os.path.join(output_dir, f'all_joints_velocity_tracking_data_env{self.tracking_env_id}_{timestamp}.csv')
-            np.savetxt(csv_filename, csv_data, delimiter=',', header=header)
-            
-            print(f"Saved multi-joint velocity tracking data and plot to {filename}")
-            print(f"Saved metrics summary to {summary_filename}")
-            print(f"Saved raw data to {csv_filename}")
-            
-        else:
-            # Single joint tracking (original code)
-            actual_count = len(self.position_tracking_data["actual_velocities"])
-            cmd_count = len(self.position_tracking_data["commanded_velocities"])
-            
-            print(f"Plotting data: timesteps={timesteps_count}, commanded={cmd_count}, actual={actual_count}")
-            
-            # Check if data lengths match
-            if timesteps_count != cmd_count or timesteps_count != actual_count:
-                print("WARNING: Data array lengths don't match!")
-                print(f"  timesteps: {timesteps_count}, commanded: {cmd_count}, actual: {actual_count}")
-                # Adjust the arrays to the same length if needed
-                min_len = min(timesteps_count, cmd_count, actual_count)
-                self.position_tracking_data["timesteps"] = self.position_tracking_data["timesteps"][:min_len]
-                self.position_tracking_data["commanded_velocities"] = self.position_tracking_data["commanded_velocities"][:min_len]
-                self.position_tracking_data["actual_velocities"] = self.position_tracking_data["actual_velocities"][:min_len]
-            
-            # Create the plot
-            plt.figure(figsize=(12, 6))
-            times = np.array(self.position_tracking_data["timesteps"])
-            commanded = np.array(self.position_tracking_data["commanded_velocities"])
-            actual = np.array(self.position_tracking_data["actual_velocities"])
-            
-            # Only plot up to the length of the shortest array
-            min_len = min(len(times), len(commanded), len(actual))
-            print(f"Plotting {min_len} data points")
-            
-            plt.plot(times[:min_len], commanded[:min_len], 'b-', label=f'Commanded Velocity (Joint {self.tracking_joint_id})')
-            plt.plot(times[:min_len], actual[:min_len], 'r-', label=f'Actual Velocity (Joint {self.tracking_joint_id})')
-            
-            plt.xlabel('Time (s)')
-            plt.ylabel('Joint Velocity (rad/s)')
-            plt.title(f'Joint Velocity Tracking - Env {self.tracking_env_id}, Joint {self.tracking_joint_id}')
-            plt.legend()
-            plt.grid(True)
-            
-            # Calculate velocity tracking error metrics
-            if min_len > 0:
-                error = commanded[:min_len] - actual[:min_len]
-                rmse = np.sqrt(np.mean(np.square(error)))
-                max_error = np.max(np.abs(error))
-                avg_error = np.mean(np.abs(error))
-                
-                plt.figtext(0.02, 0.02, 
-                          f'RMSE: {rmse:.4f} rad/s\nMax Error: {max_error:.4f} rad/s\nAvg Error: {avg_error:.4f} rad/s',
-                          bbox={'facecolor': 'white', 'alpha': 0.8, 'pad': 5})
-            
-            # Save the plot
-            filename = os.path.join(output_dir, f'joint_velocity_tracking_env{self.tracking_env_id}_joint{self.tracking_joint_id}_{timestamp}.png')
-            plt.savefig(filename)
-            plt.close()
-            
-            # Optional: Save the raw data as CSV
-            data = np.column_stack((times[:min_len], commanded[:min_len], actual[:min_len]))
-            csv_filename = os.path.join(output_dir, f'joint_velocity_tracking_data_env{self.tracking_env_id}_joint{self.tracking_joint_id}_{timestamp}.csv')
-            np.savetxt(
-                csv_filename,
-                data,
-                delimiter=',',
-                header='time,commanded_velocity,actual_velocity'
-            )
-            
-            print(f"Saved velocity tracking data and plot to {filename} at t={self.sim.current_time:.2f}s")
-        
-        return filename
+        pass
 
-    # Add a new method to save observation plots
     def save_observation_plots(self):
-        print("#############################################")
-        print("Saving observation visualization plots")
-        print("#############################################")
-        
-        # Check if we have data to plot
-        if not self.observation_viz_data["timesteps"]:
-            print("No observation data to plot!")
-            return
-            
-        import matplotlib.pyplot as plt
-        from datetime import datetime
-        import os
-        import numpy as np
-        
-        # Create output directory if it doesn't exist
-        output_dir = os.path.join(os.getcwd(), "observation_plots")
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Get timestamp for filenames
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # Convert lists to numpy arrays for easier plotting
-        times = np.array(self.observation_viz_data["timesteps"])
-        
-        # Count of data points collected
-        num_points = len(times)
-        print(f"Plotting {num_points} observation data points")
-        
-        # --- Plot 1: Joint Positions ---
-        if "joint_pos" in self.components_to_plot:
-            joint_positions = np.array(self.observation_viz_data["joint_pos"])
-            num_joints = joint_positions.shape[1]
-            
-            fig, ax = plt.subplots(figsize=(12, 8))
-            for j in range(num_joints):
-                ax.plot(times, joint_positions[:, j], label=f'Joint {j+1}')
-            
-            ax.set_xlabel('Time (s)')
-            ax.set_ylabel('Normalized Joint Position [-1, 1]')
-            ax.set_title(f'Normalized Joint Positions Over Time - Env {self.visualization_env_id}')
-            ax.legend(loc='upper right')
-            ax.grid(True)
-            
-            # Save the plot
-            filename = os.path.join(output_dir, f'joint_positions_{timestamp}.png')
-            plt.savefig(filename)
-            plt.close()
-            print(f"Saved joint position plot to {filename}")
-            
-        # --- Plot 2: Joint Velocities ---
-        if "joint_vel" in self.components_to_plot:
-            joint_velocities = np.array(self.observation_viz_data["joint_vel"])
-            num_joints = joint_velocities.shape[1]
-            
-            fig, ax = plt.subplots(figsize=(12, 8))
-            for j in range(num_joints):
-                ax.plot(times, joint_velocities[:, j], label=f'Joint {j+1}')
-            
-            ax.set_xlabel('Time (s)')
-            ax.set_ylabel('Scaled Joint Velocity')
-            ax.set_title(f'Scaled Joint Velocities Over Time - Env {self.visualization_env_id}')
-            ax.legend(loc='upper right')
-            ax.grid(True)
-            
-            # Save the plot
-            filename = os.path.join(output_dir, f'joint_velocities_{timestamp}.png')
-            plt.savefig(filename)
-            plt.close()
-            print(f"Saved joint velocity plot to {filename}")
-            
-        # --- Plot 3: Root Position (World vs Local Frame) ---
-        if "root_pos" in self.components_to_plot and "root_pos_w" in self.observation_viz_data:
-            root_positions = np.array(self.observation_viz_data["root_pos"])
-            root_positions_w = np.array(self.observation_viz_data["root_pos_w"])
-            env_origins = np.array(self.observation_viz_data["env_origin"])
-            
-            # Create a 2x3 subplot grid (2 rows, 3 columns)
-            fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-            
-            # Row 1: World frame position and environment origin
-            axes[0, 0].plot(times, root_positions_w[:, 0], 'b-', label='X Position (World)')
-            axes[0, 0].plot(times, env_origins[:, 0], 'b--', label='X Origin')
-            axes[0, 0].set_ylabel('X Position (m)')
-            axes[0, 0].set_title('X Position - World Frame')
-            axes[0, 0].legend()
-            axes[0, 0].grid(True)
-            
-            axes[0, 1].plot(times, root_positions_w[:, 1], 'g-', label='Y Position (World)')
-            axes[0, 1].plot(times, env_origins[:, 1], 'g--', label='Y Origin')
-            axes[0, 1].set_ylabel('Y Position (m)')
-            axes[0, 1].set_title('Y Position - World Frame')
-            axes[0, 1].legend()
-            axes[0, 1].grid(True)
-            
-            axes[0, 2].plot(times, root_positions_w[:, 2], 'r-', label='Z Position (World)')
-            axes[0, 2].plot(times, env_origins[:, 2], 'r--', label='Z Origin')
-            axes[0, 2].set_ylabel('Z Position (m)')
-            axes[0, 2].set_title('Z Position - World Frame')
-            axes[0, 2].legend()
-            axes[0, 2].grid(True)
-            
-            # Row 2: Local frame position
-            axes[1, 0].plot(times, root_positions[:, 0], 'b-', label='X Position (Local)')
-            axes[1, 0].set_xlabel('Time (s)')
-            axes[1, 0].set_ylabel('X Position (m)')
-            axes[1, 0].set_title('X Position - Local Frame')
-            axes[1, 0].legend()
-            axes[1, 0].grid(True)
-            
-            axes[1, 1].plot(times, root_positions[:, 1], 'g-', label='Y Position (Local)')
-            axes[1, 1].set_xlabel('Time (s)')
-            axes[1, 1].set_ylabel('Y Position (m)')
-            axes[1, 1].set_title('Y Position - Local Frame')
-            axes[1, 1].legend()
-            axes[1, 1].grid(True)
-            
-            axes[1, 2].plot(times, root_positions[:, 2], 'r-', label='Z Position (Local)')
-            axes[1, 2].set_xlabel('Time (s)')
-            axes[1, 2].set_ylabel('Z Position (m)')
-            axes[1, 2].set_title('Z Position - Local Frame')
-            axes[1, 2].legend()
-            axes[1, 2].grid(True)
-            
-            plt.tight_layout()
-            
-            # Save the plot
-            filename = os.path.join(output_dir, f'root_position_comparison_{timestamp}.png')
-            plt.savefig(filename)
-            plt.close()
-            print(f"Saved root position comparison plot to {filename}")
-            
-            # Also save the original single plot for local frame
-            fig, ax = plt.subplots(figsize=(12, 8))
-            ax.plot(times, root_positions[:, 0], label='X Position')
-            ax.plot(times, root_positions[:, 1], label='Y Position')
-            ax.plot(times, root_positions[:, 2], label='Z Position')
-            
-            ax.set_xlabel('Time (s)')
-            ax.set_ylabel('Position (m)')
-            ax.set_title(f'Root Position (Local Frame) Over Time - Env {self.visualization_env_id}')
-            ax.legend(loc='upper right')
-            ax.grid(True)
-            
-            # Save the plot
-            filename = os.path.join(output_dir, f'root_position_{timestamp}.png')
-            plt.savefig(filename)
-            plt.close()
-            
-        # --- Plot 4: Root Linear Velocity (World vs Local Frame) ---
-        if "root_lin_vel" in self.components_to_plot and "root_lin_vel_w" in self.observation_viz_data:
-            root_lin_vels = np.array(self.observation_viz_data["root_lin_vel"])
-            root_lin_vels_w = np.array(self.observation_viz_data["root_lin_vel_w"])
-            
-            # Create a 2x3 subplot grid
-            fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-            
-            # Row 1: World frame velocities
-            axes[0, 0].plot(times, root_lin_vels_w[:, 0], 'b-')
-            axes[0, 0].set_ylabel('X Velocity (m/s)')
-            axes[0, 0].set_title('X Velocity - World Frame')
-            axes[0, 0].grid(True)
-            
-            axes[0, 1].plot(times, root_lin_vels_w[:, 1], 'g-')
-            axes[0, 1].set_ylabel('Y Velocity (m/s)')
-            axes[0, 1].set_title('Y Velocity - World Frame')
-            axes[0, 1].grid(True)
-            
-            axes[0, 2].plot(times, root_lin_vels_w[:, 2], 'r-')
-            axes[0, 2].set_ylabel('Z Velocity (m/s)')
-            axes[0, 2].set_title('Z Velocity - World Frame')
-            axes[0, 2].grid(True)
-            
-            # Row 2: Local frame velocities
-            axes[1, 0].plot(times, root_lin_vels[:, 0], 'b-')
-            axes[1, 0].set_xlabel('Time (s)')
-            axes[1, 0].set_ylabel('X Velocity (m/s)')
-            axes[1, 0].set_title('X Velocity - Local Frame')
-            axes[1, 0].grid(True)
-            
-            axes[1, 1].plot(times, root_lin_vels[:, 1], 'g-')
-            axes[1, 1].set_xlabel('Time (s)')
-            axes[1, 1].set_ylabel('Y Velocity (m/s)')
-            axes[1, 1].set_title('Y Velocity - Local Frame')
-            axes[1, 1].grid(True)
-            
-            axes[1, 2].plot(times, root_lin_vels[:, 2], 'r-')
-            axes[1, 2].set_xlabel('Time (s)')
-            axes[1, 2].set_ylabel('Z Velocity (m/s)')
-            axes[1, 2].set_title('Z Velocity - Local Frame')
-            axes[1, 2].grid(True)
-            
-            plt.tight_layout()
-            
-            # Save the plot
-            filename = os.path.join(output_dir, f'root_velocity_comparison_{timestamp}.png')
-            plt.savefig(filename)
-            plt.close()
-            print(f"Saved root velocity comparison plot to {filename}")
-            
-            # Also save the original single plot for local frame
-            fig, ax = plt.subplots(figsize=(12, 8))
-            ax.plot(times, root_lin_vels[:, 0], label='X Velocity')
-            ax.plot(times, root_lin_vels[:, 1], label='Y Velocity')
-            ax.plot(times, root_lin_vels[:, 2], label='Z Velocity')
-            
-            ax.set_xlabel('Time (s)')
-            ax.set_ylabel('Velocity (m/s)')
-            ax.set_title(f'Root Linear Velocity (Local Frame) Over Time - Env {self.visualization_env_id}')
-            ax.legend(loc='upper right')
-            ax.grid(True)
-            
-            # Save the plot
-            filename = os.path.join(output_dir, f'root_linear_velocity_{timestamp}.png')
-            plt.savefig(filename)
-            plt.close()
-            
-        # --- Plot 5: Root Orientation (Quaternion) ---
-        if "root_quat" in self.components_to_plot:
-            root_quats = np.array(self.observation_viz_data["root_quat"])
-            
-            fig, ax = plt.subplots(figsize=(12, 8))
-            ax.plot(times, root_quats[:, 0], label='Quat W')
-            ax.plot(times, root_quats[:, 1], label='Quat X')
-            ax.plot(times, root_quats[:, 2], label='Quat Y')
-            ax.plot(times, root_quats[:, 3], label='Quat Z')
-            
-            ax.set_xlabel('Time (s)')
-            ax.set_ylabel('Quaternion Values')
-            ax.set_title(f'Root Orientation Quaternion Over Time - Env {self.visualization_env_id}')
-            ax.legend(loc='upper right')
-            ax.grid(True)
-            
-            # Save the plot
-            filename = os.path.join(output_dir, f'root_orientation_{timestamp}.png')
-            plt.savefig(filename)
-            plt.close()
-            print(f"Saved root orientation plot to {filename}")
-            
-        # --- Plot 6: Policy Observation (flattened) ---
-        # This is more complex, but useful to verify the shape and pattern
-        # of observations actually passed to the policy
-        if "flattened_policy_obs" in self.components_to_plot:
-            flattened_obs = np.array(self.observation_viz_data["flattened_policy_obs"])
-            
-            # To visualize this complex data, let's create a heatmap of the observations over time
-            plt.figure(figsize=(15, 10))
-            
-            # Create a 2D heatmap where:
-            # - X-axis: observation dimension
-            # - Y-axis: time
-            # - Color: observation value
-            plt.imshow(flattened_obs, aspect='auto', interpolation='none', cmap='viridis')
-            
-            plt.colorbar(label='Observation Value')
-            plt.xlabel('Observation Dimension')
-            plt.ylabel('Time Step')
-            plt.title(f'Policy Observation Heatmap Over Time - Env {self.visualization_env_id}')
-            
-            # Save the plot
-            filename = os.path.join(output_dir, f'policy_observations_heatmap_{timestamp}.png')
-            plt.savefig(filename)
-            plt.close()
-            print(f"Saved policy observation heatmap to {filename}")
-            
-            # Also save a line plot for the first few dimensions
-            max_dims_to_plot = min(20, flattened_obs.shape[1])  # Plot at most 20 dimensions
-            
-            plt.figure(figsize=(15, 10))
-            for i in range(max_dims_to_plot):
-                plt.plot(times, flattened_obs[:, i], label=f'Dim {i}')
-                
-            plt.xlabel('Time (s)')
-            plt.ylabel('Observation Value')
-            plt.title(f'First {max_dims_to_plot} Policy Observation Dimensions - Env {self.visualization_env_id}')
-            plt.legend(loc='upper right', ncol=4)
-            plt.grid(True)
-            
-            # Save the plot
-            filename = os.path.join(output_dir, f'policy_observations_line_{timestamp}.png')
-            plt.savefig(filename)
-            plt.close()
-            print(f"Saved policy observation line plot to {filename}")
-        
-        # Save raw data for further analysis
-        raw_data_filename = os.path.join(output_dir, f'observation_raw_data_{timestamp}.npz')
-        np.savez(
-            raw_data_filename,
-            times=times,
-            joint_positions=np.array(self.observation_viz_data["joint_pos"]),
-            joint_velocities=np.array(self.observation_viz_data["joint_vel"]),
-            root_positions=np.array(self.observation_viz_data["root_pos"]), 
-            root_quaternions=np.array(self.observation_viz_data["root_quat"]),
-            root_linear_velocities=np.array(self.observation_viz_data["root_lin_vel"]),
-            policy_observations=np.array(self.observation_viz_data["flattened_policy_obs"]),
-            # Add world frame data if available
-            root_positions_world=np.array(self.observation_viz_data.get("root_pos_w", [[0, 0, 0]])),
-            root_linear_velocities_world=np.array(self.observation_viz_data.get("root_lin_vel_w", [[0, 0, 0]])),
-            env_origins=np.array(self.observation_viz_data.get("env_origin", [[0, 0, 0]]))
-        )
-        print(f"Saved raw observation data to {raw_data_filename}")
-        
-        return output_dir
+        pass
