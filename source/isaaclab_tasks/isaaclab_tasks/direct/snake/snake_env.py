@@ -445,6 +445,9 @@ class SnakeEnv(DirectRLEnv):
             # Just use the current observation if history is disabled
             observations = {"policy": current_obs}
         
+        # Update logs with tracking and observation data
+        self._update_logs(observations)
+        
         return observations
 
     def _get_rewards(self) -> torch.Tensor:
@@ -669,30 +672,12 @@ class SnakeEnv(DirectRLEnv):
                 for t in range(self.history_length):
                     self.obs_history[env_ids, t, :] = initial_obs
 
-    # --- Override the step method ---
-    def step(self, actions: torch.Tensor) -> tuple[dict, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+    def _update_logs(self, obs_dict: dict) -> None:
+        """Update logs with tracking and observation data."""
         # Initialize log dict if not present
         if "log" not in self.extras:
             self.extras["log"] = {}
-            
-        # Get observations before stepping
-        obs_dict = self._get_observations()
-        
-        # Apply actions
-        self._pre_physics_step(actions)
-        
-        # Step physics
-        for _ in range(self.cfg.decimation):
-            self.sim.step(render=self._render)
-            self.sim.render()
-        
-        # Get observations after stepping
-        obs_dict = self._get_observations()
-        
-        # Get rewards and dones
-        rew = self._get_rewards()
-        terminated, truncated = self._get_dones()
-        
+
         # Log tracking data if enabled
         if self.cfg.position_tracking.enable:
             env_id = self.cfg.position_tracking.env_id
@@ -750,12 +735,3 @@ class SnakeEnv(DirectRLEnv):
                 
                 for i in range(len(policy_obs)):
                     self.extras["log"][f"Observations/PolicyObs/Dim{i}"] = policy_obs[i].item()
-        
-        return obs_dict, rew, terminated, truncated, self.extras
-    # --- End override ---
-    
-    def save_position_tracking_plot(self):
-        pass
-
-    def save_observation_plots(self):
-        pass
