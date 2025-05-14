@@ -30,7 +30,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     # env
     decimation = 2
     episode_length_s = 50.0
-    action_scale = 1.0  # rad/s - velocity control scale  #TODO: tune this
+    action_scale = 0.1  # rad/s # Action scale determines how much the target velocity changes per RL step
     action_space = 9    # 9 joints
     observation_space = 31  # Updated: 9 (joints) + 9 (vels) + 3 (pos) + 4 (quat) + 3 (vel) + 3 (target)
     state_space = 0
@@ -97,10 +97,10 @@ class SnakeEnvCfg(DirectRLEnvCfg):
             "snake_joints": ImplicitActuatorCfg(
                 # Use regex matching your joint names, or list them
                 joint_names_expr=["joint_[1-9]"], # Example regex
-                effort_limit=1000.0,   # <<< Tune based on your robot's specs
-                velocity_limit=10.0,  # <<< Tune based on your robot's specs
+                effort_limit=100.0,   # (Nm) <<< Tune based on your robot's specs
+                velocity_limit=0.5,  # (rad/s) <<< Tune based on your robot's specs
                 stiffness=0.0,       # <<< Tune: Use >0 for position/velocity control
-                damping=1000.0,        # <<< Tune: Use >0 for position/velocity control (helps stability)
+                damping=10000.0,        # <<< Tune: Use >0 for position/velocity control (helps stability)
             ),
             # Add more actuator groups if joints have different properties
         },
@@ -126,8 +126,6 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     joint_angle_range = [-1.57, 1.57] # rad
 
     # -- Task-Specific Parameters
-    # Action scale now determines how much the target velocity changes per RL step
-    action_scale = 1.0  # rad/s - For velocity control, scale can be larger than position control
     
     # reward scales 
     rew_scale_forward_velocity = 0.0  # Not using this in position target approach
@@ -148,20 +146,16 @@ class SnakeEnvCfg(DirectRLEnvCfg):
         """Configuration for testing modes."""
         # Set to True to override RL actions with manual oscillation
         enable_manual_oscillation: bool = True
-        
         # --- Sidewinding parameters ---
         # Amplitude in degrees (will be converted to radians)
         amplitude_x_deg: float = 30.0  # Amplitude for even joints
         amplitude_y_deg: float = 30.0  # Amplitude for odd joints
-        
         # Angular frequency
         omega_x: float = 5.0 * math.pi / 6.0  # Angular frequency for even joints
         omega_y: float = 5.0 * math.pi / 6.0  # Angular frequency for odd joints
-        
         # Phase offset per joint
         delta_x: float = 2.0 * math.pi / 3.0  # Phase offset per even joint
         delta_y: float = 2.0 * math.pi / 3.0  # Phase offset per odd joint
-        
         # Phase difference between even and odd joints
         phi: float = 0.0
 
@@ -575,13 +569,20 @@ class SnakeEnv(DirectRLEnv):
         # terminated = out_of_bounds | too_high
         
         terminated = out_of_bounds 
+        if "log" not in self.extras:  # Initialize if not present
+            self.extras["log"] = {}
+    
+        # Add termination info to extras["log"] instead of extras["episode"]
+        self.extras["log"].update({
+            "terminations/joint_out_of_bounds": torch.sum(out_of_bounds).item(),
+            "terminations/link_too_high": torch.sum(too_high).item()
+        })
+        # # Add termination reason info to extras
+        # if "episode" not in self.extras:
+        #     self.extras["episode"] = {}
         
-        # Add termination reason info to extras
-        if "episode" not in self.extras:
-            self.extras["episode"] = {}
-        
-        self.extras["episode"]["terminations/joint_out_of_bounds"] = torch.sum(out_of_bounds).item()
-        self.extras["episode"]["terminations/link_too_high"] = torch.sum(too_high).item()
+        # self.extras["episode"]["terminations/joint_out_of_bounds"] = torch.sum(out_of_bounds).item()
+        # self.extras["episode"]["terminations/link_too_high"] = torch.sum(too_high).item()
         
         return terminated, time_out
 
