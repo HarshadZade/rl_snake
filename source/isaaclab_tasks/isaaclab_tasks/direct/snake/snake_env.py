@@ -19,7 +19,7 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils import configclass
-from isaaclab.utils.math import sample_uniform
+from isaaclab.utils.math import sample_uniform, quat_rotate
 
 from isaaclab.actuators.actuator_cfg import ImplicitActuatorCfg
 from isaaclab.terrains import TerrainImporterCfg
@@ -30,7 +30,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     # env
     decimation = 2
     episode_length_s = 50.0
-    action_scale = 0.1  # rad/s # Action scale determines how much the target velocity changes per RL step
+    action_scale = 0.26  # rad/s # Action scale determines how much the target velocity changes per RL step
     action_space = 9    # 9 joints
     observation_space = 31  # Updated: 9 (joints) + 9 (vels) + 3 (pos) + 4 (quat) + 3 (vel) + 3 (target)
     state_space = 0
@@ -47,18 +47,32 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     class TargetPositionCfg:
         """Configuration for target position task."""
         # Target position relative to the root
-        target_pos: tuple = (5, 3, 3)
+        target_pos: tuple = (-1, 0.2, 1)
         # Which link to track for reaching the target (0 is root, higher numbers for other links)
         tracked_link_idx: int = 9  # Default to the 9th link (adjust based on model)
-        # Scale for position-based reward
-        position_reward_scale: float = 10.0
         # Scale for distance threshold (when to consider target reached)
         success_distance_threshold: float = 0.5  # in meters
-        # Success bonus reward
-        success_bonus: float = 100.0
 
     target_position: TargetPositionCfg = TargetPositionCfg()
     # -- End Target Position Configuration --
+
+    # -- LQR Style Reward Parameters --
+    @configclass
+    class LQRRewardCfg:
+        """Configuration for LQR-style reward function for fixed-base snake robot."""
+        # State cost matrix diagonal elements (Q matrix)
+        joint_pos_cost: float = 0.0      # Cost on joint position deviation
+        joint_vel_cost: float = 0.0      # Cost on joint velocity
+        end_effector_cost: float = 5.0   # Cost on end-effector position deviation from target
+        
+        # Control cost matrix diagonal elements (R matrix)
+        control_cost: float = 0.01       # Cost on control inputs (joint velocities)
+        
+        # Additional reward terms
+        alive_bonus: float = 0.1         # Small bonus for staying alive
+        success_bonus: float = 100.0     # Bonus for reaching target
+
+    lqr_reward: LQRRewardCfg = LQRRewardCfg()
 
     # -- Robot Configuration (Loading from USD)
     robot: ArticulationCfg = ArticulationCfg(
@@ -97,8 +111,8 @@ class SnakeEnvCfg(DirectRLEnvCfg):
             "snake_joints": ImplicitActuatorCfg(
                 # Use regex matching your joint names, or list them
                 joint_names_expr=["joint_[1-9]"], # Example regex
-                effort_limit=50.0,   # (Nm) <<< Tune based on your robot's specs
-                velocity_limit=0.1,  # (rad/s) <<< Tune based on your robot's specs
+                effort_limit=50.0,   # (Nm) <<< Tune 
+                velocity_limit=0.262,  # (15deg/s)(rad/s) <<< Tune 
                 stiffness=0.0,       # Kp
                 damping=100.0,       # Kd
                                      # Tau = kp * (x - x0) + kd * (v - v0)
@@ -126,27 +140,14 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     # reset
     joint_angle_range = [-1.57, 1.57] # rad
 
-    # -- Task-Specific Parameters
-    
-    # reward scales 
-    rew_scale_forward_velocity = 0.0  # Not using this in position target approach
-    rew_scale_joint_vel_penalty = -0.0001  # Small penalty on joint velocities (control cost)
-    rew_scale_termination = 0.0
-    rew_scale_alive = 1.0  # Small alive bonus
-    rew_scale_action_smoothness_penalty = 0.0
-    rew_scale_lateral_velocity_penalty = 0.0
-    rew_scale_joint_limit_penalty = -5.0  # Keep joint limit penalty
-    
-    # Position target reward parameters
-    rew_scale_target_distance = 10.0  # Weight for target distance tracking term
-    rew_scale_control_cost = -0.001  # Weight for control cost term
-    
-    # --- ADD TESTING CONFIGURATION ---
+    # -- Testing Configuration --
     @configclass
     class TestingCfg:
         """Configuration for testing modes."""
         # Set to True to override RL actions with manual oscillation
-        enable_manual_oscillation: bool = True
+        enable_manual_oscillation: bool = False
+        # Type of manual oscillation ('sidewinding' or 'constant')
+        oscillation_type: str = 'constant'
         # --- Sidewinding parameters ---
         # Amplitude in degrees (will be converted to radians)
         amplitude_x_deg: float = 30.0  # Amplitude for even joints
@@ -159,6 +160,8 @@ class SnakeEnvCfg(DirectRLEnvCfg):
         delta_y: float = 2.0 * math.pi / 3.0  # Phase offset per odd joint
         # Phase difference between even and odd joints
         phi: float = 0.0
+        # --- Constant velocity parameters ---
+        constant_velocity: float = 0.262  # rad/s, constant velocity for all joints
 
     testing: TestingCfg = TestingCfg()
     # --- END TESTING CONFIGURATION ---
@@ -297,43 +300,49 @@ class SnakeEnv(DirectRLEnv):
         
         # Check if manual oscillation test mode is enabled
         if self.cfg.testing.enable_manual_oscillation:
-            # --- SIDEWINDING MOTION PATTERN ---
-            current_time = self.sim.current_time
-
-            # Parameters from config
-            # Convert amplitude from degrees to radians
-            amplitude_x_rad = math.radians(self.cfg.testing.amplitude_x_deg)
-            amplitude_y_rad = math.radians(self.cfg.testing.amplitude_y_deg)
-            
-            # Angular frequencies
-            omega_x = self.cfg.testing.omega_x
-            omega_y = self.cfg.testing.omega_y
-            
-            # Phase offsets
-            delta_x = self.cfg.testing.delta_x
-            delta_y = self.cfg.testing.delta_y
-            
-            # Phase difference between patterns
-            phi = self.cfg.testing.phi
-            
-            # Number of joints
-            num_joints = self.snake_robot.num_joints
-            
             # Create tensor to hold velocity targets
+            num_joints = self.snake_robot.num_joints
             velocity_targets = torch.zeros((num_joints,), device=self.device)
             
-            # Calculate velocity for each joint (derivative of position function)
-            for i in range(num_joints):
-                if i % 2 == 0:  # Even joints
-                    # velocity(n,t) = Ax * wx * cos(wx*t + n*deltax)
-                    velocity_targets[i] = amplitude_x_rad * omega_x * torch.cos(
-                        torch.tensor(omega_x * current_time + i * delta_x)
-                    )
-                else:  # Odd joints
-                    # velocity(n,t) = Ay * wy * cos(wy*t + n*deltay + phi)
-                    velocity_targets[i] = amplitude_y_rad * omega_y * torch.cos(
-                        torch.tensor(omega_y * current_time + i * delta_y + phi)
-                    )
+            if self.cfg.testing.oscillation_type == 'sidewinding':
+                # --- SIDEWINDING MOTION PATTERN ---
+                current_time = self.sim.current_time
+
+                # Parameters from config
+                # Convert amplitude from degrees to radians
+                amplitude_x_rad = math.radians(self.cfg.testing.amplitude_x_deg)
+                amplitude_y_rad = math.radians(self.cfg.testing.amplitude_y_deg)
+                
+                # Angular frequencies
+                omega_x = self.cfg.testing.omega_x
+                omega_y = self.cfg.testing.omega_y
+                
+                # Phase offsets
+                delta_x = self.cfg.testing.delta_x
+                delta_y = self.cfg.testing.delta_y
+                
+                # Phase difference between patterns
+                phi = self.cfg.testing.phi
+                
+                # Calculate velocity for each joint (derivative of position function)
+                for i in range(num_joints):
+                    if i % 2 == 0:  # Even joints
+                        # velocity(n,t) = Ax * wx * cos(wx*t + n*deltax)
+                        velocity_targets[i] = amplitude_x_rad * omega_x * torch.cos(
+                            torch.tensor(omega_x * current_time + i * delta_x)
+                        )
+                    else:  # Odd joints
+                        # velocity(n,t) = Ay * wy * cos(wy*t + n*deltay + phi)
+                        velocity_targets[i] = amplitude_y_rad * omega_y * torch.cos(
+                            torch.tensor(omega_y * current_time + i * delta_y + phi)
+                        )
+            
+            elif self.cfg.testing.oscillation_type == 'constant':
+                # Set all joints to the same constant velocity
+                velocity_targets.fill_(self.cfg.testing.constant_velocity)
+            
+            else:
+                raise ValueError(f"Unknown oscillation type: {self.cfg.testing.oscillation_type}")
             
             # Expand to all environments
             self.joint_vel_targets[:] = velocity_targets.unsqueeze(0).expand(self.num_envs, -1)
@@ -447,12 +456,9 @@ class SnakeEnv(DirectRLEnv):
 
     def _get_rewards(self) -> torch.Tensor:
         """
-        Calculate rewards based on distance to target position.
-        Reward structure:
-        1. Negative exponential of distance to target (closer = higher reward)
-        2. Success bonus for reaching the target
-        3. Control cost for joint velocities
-        4. Joint limit penalties for safety
+        Calculate rewards using an LQR-style quadratic cost function for fixed-base snake robot.
+        Total reward = -(state_cost + control_cost) + alive_bonus + success_bonus
+        where state_cost = x^T Q x and control_cost = u^T R u
         """
         # Initialize log dict if not present
         if "log" not in self.extras:
@@ -461,71 +467,72 @@ class SnakeEnv(DirectRLEnv):
         # Get current state information
         joint_pos = self.snake_robot.data.joint_pos
         joint_vel = self.snake_robot.data.joint_vel
+        root_pos_w = self.snake_robot.data.root_pos_w  # Need root position to calculate target in world frame
         
-        # --- Target distance component ---
-        # Get root position in world frame
-        root_pos_w = self.snake_robot.data.root_pos_w  # [num_envs, 3]
-        
-        # Get tracked link position (for reaching the target)
+        # Get end-effector (last link) position
         link_positions_w = self.snake_robot.data.body_pos_w  # Shape: [num_envs, num_links, 3]
+        last_link_idx = link_positions_w.shape[1] - 1
+        end_effector_pos = link_positions_w[:, last_link_idx]  # Shape: [num_envs, 3]
         
-        # Ensure tracked link index is valid
-        num_links = link_positions_w.shape[1]
-        tracked_idx = torch.clamp(self.tracked_link_idx, 0, num_links - 1)[0]
+        # --- State Costs (x^T Q x) ---
         
-        # Get the position of the tracked link
-        tracked_link_pos = link_positions_w[:, tracked_idx]  # [num_envs, 3]
+        # 1. Joint position cost (deviation from zero/neutral position)
+        joint_pos_cost = self.cfg.lqr_reward.joint_pos_cost * torch.sum(joint_pos**2, dim=1)
         
-        # Calculate target position in world frame for each environment
+        # 2. Joint velocity cost
+        joint_vel_cost = self.cfg.lqr_reward.joint_vel_cost * torch.sum(joint_vel**2, dim=1)
+        
+        # 3. End-effector position cost (deviation from target)
+        # Calculate target position in world frame for each environment (relative to root)
         target_pos_w = root_pos_w + self.target_position.unsqueeze(0)  # [num_envs, 3]
+        end_effector_cost = self.cfg.lqr_reward.end_effector_cost * torch.sum((end_effector_pos - target_pos_w)**2, dim=1)
         
-        # Calculate distance to target
-        distance_to_target = torch.norm(tracked_link_pos - target_pos_w, dim=1)  # [num_envs]
+        # Total state cost
+        state_cost = (
+            joint_pos_cost +
+            joint_vel_cost +
+            end_effector_cost
+        )
         
-        # Update closest distance tracker
-        self.closest_distance = torch.minimum(self.closest_distance, distance_to_target)
+        # --- Control Costs (u^T R u) ---
+        # Use the commanded joint velocities as control inputs
+        control_cost = self.cfg.lqr_reward.control_cost * torch.sum(self.joint_vel_targets**2, dim=1)
+        
+        # --- Additional Reward Terms ---
         
         # Check if target reached (within threshold)
+        distance_to_target = torch.norm(end_effector_pos - target_pos_w, dim=1)
         threshold = self.cfg.target_position.success_distance_threshold
         newly_reached = (distance_to_target < threshold) & (~self.target_reached)
         self.target_reached = self.target_reached | newly_reached
         
-        # Calculate distance-based reward (exponential of negative distance)
-        # This gives higher reward as robot gets closer to target
-        distance_reward = self.cfg.rew_scale_target_distance * torch.exp(-distance_to_target)
+        # Update closest distance tracker
+        self.closest_distance = torch.minimum(self.closest_distance, distance_to_target)
         
-        # Add success bonus for environments that just reached the target
-        success_bonus = torch.zeros_like(distance_reward)
-        success_bonus[newly_reached] = self.cfg.target_position.success_bonus
+        # Success bonus for reaching target
+        success_bonus = torch.zeros_like(distance_to_target)
+        success_bonus[newly_reached] = self.cfg.lqr_reward.success_bonus
         
-        # --- Control cost component ---
-        # Penalize control effort (joint velocities)
-        control_cost = self.cfg.rew_scale_control_cost * torch.sum(joint_vel**2, dim=1)
+        # Alive bonus
+        alive_bonus = self.cfg.lqr_reward.alive_bonus
         
-        # --- Joint limit penalty (safety constraint) ---
-        normalized_joint_pos = (joint_pos - self.joint_pos_mid) / (self.joint_pos_ranges / 2)
-        joint_limit_penalty = self.cfg.rew_scale_joint_limit_penalty * torch.sum(
-            torch.maximum(torch.abs(normalized_joint_pos) - 0.5, torch.zeros_like(normalized_joint_pos))**2, 
-            dim=1
-        )
+        # --- Total Reward ---
+        # Negative cost plus bonuses
+        total_reward = -(state_cost + control_cost) + success_bonus + alive_bonus
         
-        # --- Alive bonus ---
-        alive_bonus = self.cfg.rew_scale_alive
-        
-        # Total reward
-        total_reward = distance_reward + success_bonus + control_cost + joint_limit_penalty + alive_bonus
-        
-        # Update (not overwrite) the log dictionary
+        # Update logs
         self.extras["log"].update({
-            "Rewards/distance_to_target": distance_to_target.mean().item(),
-            "Rewards/closest_distance": self.closest_distance.mean().item(),
-            "Rewards/distance_reward": distance_reward.mean().item(),
-            "Rewards/success_bonus": success_bonus.mean().item(),
-            "Rewards/targets_reached": torch.sum(self.target_reached).item(),
+            "Rewards/joint_pos_cost": joint_pos_cost.mean().item(),
+            "Rewards/joint_vel_cost": joint_vel_cost.mean().item(),
+            "Rewards/end_effector_cost": end_effector_cost.mean().item(),
+            "Rewards/state_cost": state_cost.mean().item(),
             "Rewards/control_cost": control_cost.mean().item(),
-            "Rewards/joint_limit_penalty": joint_limit_penalty.mean().item(),
+            "Rewards/success_bonus": success_bonus.mean().item(),
             "Rewards/alive_bonus": alive_bonus,
             "Rewards/total_reward": total_reward.mean().item(),
+            "Rewards/distance_to_target": distance_to_target.mean().item(),
+            "Rewards/closest_distance": self.closest_distance.mean().item(),
+            "Rewards/targets_reached": torch.sum(self.target_reached).item(),
         })
         
         return total_reward
@@ -534,56 +541,41 @@ class SnakeEnv(DirectRLEnv):
         # Time-based termination
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         
-        # # Terminate based on robot state
-        # root_pos = self.snake_robot.data.root_pos_w
-        # root_quat = self.snake_robot.data.root_quat_w
-        
-        # # Calculate up vector (z-axis) in world coordinates
-        # forward = torch.zeros((self.num_envs, 3), device=self.device)
-        # forward[:, 0] = 1.0  # Forward is along x-axis
-        
-        # # 1. Terminate if robot is flipped (head too low)
-        # head_too_low = root_pos[:, 2] < 0.05
-        
-        # # 2. Terminate if robot has flipped over significantly
-        # up = torch.zeros((self.num_envs, 3), device=self.device)
-        # up[:, 2] = 1.0  # Up is along z-axis
-        # up_world = quat_rotate(root_quat, up)
-        # too_tilted = up_world[:, 2] < 0.0  # z component negative means flipped
-        
-        # # terminated = head_too_low | too_tilted
-        
         # Get joint position bounds check
         self.joint_pos = self.snake_robot.data.joint_pos
         out_of_bounds = torch.any(self.joint_pos < self.joint_pos_lower_limits, dim=1) | \
-                        torch.any(self.joint_pos > self.joint_pos_upper_limits, dim=1) #1.57-0.524 rad = 60 deg. restricting the max angles 
+                        torch.any(self.joint_pos > self.joint_pos_upper_limits, dim=1)
         
-        # Get body position world coordinates
-        body_pos_w = self.snake_robot.data.body_pos_w  # Shape: [num_envs, num_links, 3]
+        # Get velocity limit violations - using limit from actuator config
+        joint_vel = self.snake_robot.data.joint_vel
+        velocity_limit = torch.tensor(self.cfg.robot.actuators["snake_joints"].velocity_limit, 
+                                    device=self.device)
+        vel_violation = torch.any(torch.abs(joint_vel) > velocity_limit, dim=1)
         
-        # Check if any link's height (z-coordinate) exceeds the link length
-        # The 3rd component (index 2) of the position vector is the z coordinate (height)
-        link_heights = body_pos_w[:, :, 2]  # Extract heights for all links
-        too_high = torch.any(link_heights > self.cfg.link_length, dim=1)
+        # Get torque limit violations - using limit from actuator config
+        joint_torques = self.snake_robot.data.applied_torque
+        torque_limit = torch.tensor(self.cfg.robot.actuators["snake_joints"].effort_limit, 
+                                  device=self.device)
+        torque_violation = torch.any(torch.abs(joint_torques) > torque_limit, dim=1)
         
         # Combine all termination conditions
-        # terminated = out_of_bounds | too_high
+        terminated = out_of_bounds | vel_violation | torque_violation
         
-        terminated = out_of_bounds 
         if "log" not in self.extras:  # Initialize if not present
             self.extras["log"] = {}
     
-        # Add termination info to extras["log"] instead of extras["episode"]
+        # Add termination info to extras["log"]
         self.extras["log"].update({
             "terminations/joint_out_of_bounds": torch.sum(out_of_bounds).item(),
-            "terminations/link_too_high": torch.sum(too_high).item()
+            "terminations/velocity_violations": torch.sum(vel_violation).item(),
+            "terminations/torque_violations": torch.sum(torque_violation).item(),
+            # Log max values for debugging
+            "terminations/max_velocity": torch.max(torch.abs(joint_vel)).item(),
+            "terminations/max_torque": torch.max(torch.abs(joint_torques)).item(),
+            # Log the actual limits being used
+            "terminations/velocity_limit": self.cfg.robot.actuators["snake_joints"].velocity_limit,
+            "terminations/torque_limit": self.cfg.robot.actuators["snake_joints"].effort_limit,
         })
-        # # Add termination reason info to extras
-        # if "episode" not in self.extras:
-        #     self.extras["episode"] = {}
-        
-        # self.extras["episode"]["terminations/joint_out_of_bounds"] = torch.sum(out_of_bounds).item()
-        # self.extras["episode"]["terminations/link_too_high"] = torch.sum(too_high).item()
         
         return terminated, time_out
 
@@ -606,17 +598,16 @@ class SnakeEnv(DirectRLEnv):
         # Start with default positions
         joint_pos = self.snake_robot.data.default_joint_pos[env_ids].clone()
         
-        # Option: Add a sinusoidal pattern as starting position
-        # This can help the robot start with a sensible snake-like posture
-        if True:
-            for i in range(self.snake_robot.num_joints):  # Fixed: use num_joints instead of action_space
-                # Phase offset to create a sinusoidal wave along the body
-                # Each joint is 90 degrees out of phase with the previous one
-                phase_offset = i * (math.pi / 2)
-                # Amplitude of the wave
-                amplitude = 0.2
-                # Apply sinusoidal pattern
-                joint_pos[:, i] = amplitude * torch.sin(torch.tensor(phase_offset))
+        # Create sinusoidal pattern for joint positions
+        # This creates a snake-like posture that's good for starting position
+        amplitude = 0.2  # radians (~11.5 degrees)
+        phase_diff = math.pi / 2  # 90 degrees phase difference between joints
+        
+        for i in range(self.snake_robot.num_joints):
+            # Phase offset increases along the body
+            phase_offset = i * phase_diff
+            # Apply sinusoidal pattern
+            joint_pos[:, i] = amplitude * torch.sin(torch.tensor(phase_offset))
         
         # Add small random noise to initial positions
         joint_pos += torch.randn_like(joint_pos) * 0.05
@@ -633,6 +624,7 @@ class SnakeEnv(DirectRLEnv):
         
         # Reset root state
         default_root_state = self.snake_robot.data.default_root_state[env_ids].clone()
+        # Add env origins offset to maintain proper positioning in multi-env setup
         default_root_state[:, :3] += self.scene.env_origins[env_ids]
         
         # Write states to simulation
@@ -661,9 +653,9 @@ class SnakeEnv(DirectRLEnv):
                 (
                     joint_pos_normalized,   # Normalized joint positions
                     joint_vel * 0.1,        # Scaled joint velocities (zeros)
-                    root_pos,               # Root position
-                    root_quat,              # Root orientation
-                    root_lin_vel,           # Root linear velocity (zeros)
+                    root_pos,               # Fixed root position
+                    root_quat,              # Fixed root orientation
+                    root_lin_vel,           # Zero root velocity (fixed base)
                     target_pos_relative,    # Target position relative to root
                 ),
                 dim=-1,
@@ -710,6 +702,48 @@ class SnakeEnv(DirectRLEnv):
                 avg_abs_error = total_abs_error / self.snake_robot.num_joints
                 self.extras["log"]["Tracking/AverageAbsoluteError"] = avg_abs_error
 
+        # Track last link position
+        # Get all link positions in world frame
+        link_positions_w = self.snake_robot.data.body_pos_w  # Shape: [num_envs, num_links, 3]
+        last_link_idx = link_positions_w.shape[1] - 1  # Get the index of the last link
+        
+        # Get position of last link for the visualization environment
+        env_id = self.cfg.observation_visualization.env_id if self.cfg.observation_visualization.enable else 0
+        # env_id = 3012
+        last_link_pos_world = link_positions_w[env_id, last_link_idx]  # Shape: [3]
+        
+        # Get root position in world frame
+        root_pos_world = self.snake_robot.data.root_pos_w[env_id]  # Shape: [3]
+        
+        # Calculate position relative to robot base
+        last_link_pos_relative = last_link_pos_world - root_pos_world
+        
+        # Log the world frame position components
+        self.extras["log"].update({
+            "LastLink/WorldPosition/X": last_link_pos_world[0].item(),
+            "LastLink/WorldPosition/Y": last_link_pos_world[1].item(),
+            "LastLink/WorldPosition/Z": last_link_pos_world[2].item(),
+        })
+        
+        # Log the robot-base-relative position components
+        self.extras["log"].update({
+            "LastLink/RelativePosition/X": last_link_pos_relative[0].item(),
+            "LastLink/RelativePosition/Y": last_link_pos_relative[1].item(),
+            "LastLink/RelativePosition/Z": last_link_pos_relative[2].item(),
+        })
+        
+        # Calculate and log distances in world frame
+        world_distance_from_origin = torch.norm(last_link_pos_world).item()
+        world_planar_distance = torch.norm(last_link_pos_world[:2]).item()
+        self.extras["log"]["LastLink/World/DistanceFromOrigin"] = world_distance_from_origin
+        self.extras["log"]["LastLink/World/PlanarDistance"] = world_planar_distance
+        
+        # Calculate and log distances relative to robot base
+        relative_distance = torch.norm(last_link_pos_relative).item()
+        relative_planar_distance = torch.norm(last_link_pos_relative[:2]).item()
+        self.extras["log"]["LastLink/Relative/DistanceFromBase"] = relative_distance
+        self.extras["log"]["LastLink/Relative/PlanarDistance"] = relative_planar_distance
+
         # Log mass information
         # Get masses for all links
         link_masses = self.snake_robot.data.default_mass  # Shape: [num_envs, num_bodies]
@@ -734,13 +768,6 @@ class SnakeEnv(DirectRLEnv):
             self.extras["log"][f"Torques/Joint{joint_idx}/computed"] = joint_torques_computed[env_id, joint_idx].item()
             self.extras["log"][f"Torques/Joint{joint_idx}/applied"] = joint_torques_applied[env_id, joint_idx].item()
             
-        # Log joint damping and stiffness
-        joint_damping = self.snake_robot.data.joint_damping  # Shape: [num_envs, num_joints]
-        joint_stiffness = self.snake_robot.data.joint_stiffness  # Shape: [num_envs, num_joints]
-        for joint_idx in range(self.snake_robot.num_joints):
-            self.extras["log"][f"JointProperties/Joint{joint_idx}/Damping"] = joint_damping[env_id, joint_idx].item()
-            self.extras["log"][f"JointProperties/Joint{joint_idx}/Stiffness"] = joint_stiffness[env_id, joint_idx].item()
-
         # Log observation data if enabled
         if self.cfg.observation_visualization.enable:
             env_id = self.cfg.observation_visualization.env_id
