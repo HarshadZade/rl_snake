@@ -100,7 +100,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
                 effort_limit=50.0,   # (Nm) <<< Tune based on your robot's specs
                 velocity_limit=0.1,  # (rad/s) <<< Tune based on your robot's specs
                 stiffness=0.0,       # Kp
-                damping=150.0,       # Kd
+                damping=100.0,       # Kd
                                      # Tau = kp * (x - x0) + kd * (v - v0)
             ),
             # Add more actuator groups if joints have different properties
