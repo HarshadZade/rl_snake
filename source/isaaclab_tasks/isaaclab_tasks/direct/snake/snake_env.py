@@ -89,7 +89,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
                  "joint_8": 0.0,
                  "joint_9": 0.0,
             },
-            pos=(0.0, 0.0, 1.0),  # Initial base position (adjust height based on robot)
+            pos=(0.0, 0.0, 0.0375),  # Initial base position (adjust height based on robot)
             rot=(0.0, 0.0, 0.0, 1.0), # Initial base orientation
         ),
         actuators={
@@ -97,10 +97,11 @@ class SnakeEnvCfg(DirectRLEnvCfg):
             "snake_joints": ImplicitActuatorCfg(
                 # Use regex matching your joint names, or list them
                 joint_names_expr=["joint_[1-9]"], # Example regex
-                effort_limit=100.0,   # (Nm) <<< Tune based on your robot's specs
-                velocity_limit=0.5,  # (rad/s) <<< Tune based on your robot's specs
-                stiffness=0.0,       # <<< Tune: Use >0 for position/velocity control
-                damping=10000.0,        # <<< Tune: Use >0 for position/velocity control (helps stability)
+                effort_limit=50.0,   # (Nm) <<< Tune based on your robot's specs
+                velocity_limit=0.1,  # (rad/s) <<< Tune based on your robot's specs
+                stiffness=0.0,       # Kp
+                damping=150.0,       # Kd
+                                     # Tau = kp * (x - x0) + kd * (v - v0)
             ),
             # Add more actuator groups if joints have different properties
         },
@@ -683,19 +684,63 @@ class SnakeEnv(DirectRLEnv):
         if self.cfg.position_tracking.enable:
             env_id = self.cfg.position_tracking.env_id
             if self.track_all_joints:
+                # Initialize sum for average calculation
+                total_abs_error = 0.0
+                
                 # Log commanded and actual velocities for each joint
                 for joint_idx in range(self.snake_robot.num_joints):
+                    commanded_vel = self.joint_vel_targets[env_id, joint_idx]
+                    actual_vel = self.snake_robot.data.joint_vel[env_id, joint_idx]
+                    
                     self.extras["log"].update({
-                        f"Tracking/Joint{joint_idx}/CommandedVelocity": self.joint_vel_targets[env_id, joint_idx].item(),
-                        f"Tracking/Joint{joint_idx}/ActualVelocity": self.snake_robot.data.joint_vel[env_id, joint_idx].item(),
+                        f"Tracking/Joint{joint_idx}/CommandedVelocity": commanded_vel.item(),
+                        f"Tracking/Joint{joint_idx}/ActualVelocity": actual_vel.item(),
                     })
                     # Calculate and log error metrics
-                    error = self.joint_vel_targets[env_id, joint_idx] - self.snake_robot.data.joint_vel[env_id, joint_idx]
+                    error = commanded_vel - actual_vel
+                    abs_error = abs(error.item())
+                    total_abs_error += abs_error
+                    
                     self.extras["log"].update({
                         f"Tracking/Joint{joint_idx}/Error": error.item(),
-                        f"Tracking/Joint{joint_idx}/AbsError": abs(error.item()),
+                        f"Tracking/Joint{joint_idx}/AbsError": abs_error,
                     })
+                
+                # Calculate and log average absolute error across all joints
+                avg_abs_error = total_abs_error / self.snake_robot.num_joints
+                self.extras["log"]["Tracking/AverageAbsoluteError"] = avg_abs_error
+
+        # Log mass information
+        # Get masses for all links
+        link_masses = self.snake_robot.data.default_mass  # Shape: [num_envs, num_bodies]
+        total_mass = torch.sum(link_masses, dim=1)  # Shape: [num_envs]
+
+        # Log masses for visualization env
+        env_id = self.cfg.observation_visualization.env_id if self.cfg.observation_visualization.enable else 0
         
+        # Log individual link masses
+        for link_idx in range(link_masses.shape[1]):
+            self.extras["log"][f"Masses/Link{link_idx}"] = link_masses[env_id, link_idx].item()
+        
+        # Log total mass
+        self.extras["log"]["Masses/TotalRobotMass"] = total_mass[env_id].item()
+
+        # Log actuator torques
+        joint_torques_computed = self.snake_robot.data.computed_torque  # Shape: [num_envs, num_joints]
+        joint_torques_applied = self.snake_robot.data.applied_torque  # Shape: [num_envs, num_joints]
+        
+        # Log torques for each joint
+        for joint_idx in range(self.snake_robot.num_joints):
+            self.extras["log"][f"Torques/Joint{joint_idx}/computed"] = joint_torques_computed[env_id, joint_idx].item()
+            self.extras["log"][f"Torques/Joint{joint_idx}/applied"] = joint_torques_applied[env_id, joint_idx].item()
+            
+        # Log joint damping and stiffness
+        joint_damping = self.snake_robot.data.joint_damping  # Shape: [num_envs, num_joints]
+        joint_stiffness = self.snake_robot.data.joint_stiffness  # Shape: [num_envs, num_joints]
+        for joint_idx in range(self.snake_robot.num_joints):
+            self.extras["log"][f"JointProperties/Joint{joint_idx}/Damping"] = joint_damping[env_id, joint_idx].item()
+            self.extras["log"][f"JointProperties/Joint{joint_idx}/Stiffness"] = joint_stiffness[env_id, joint_idx].item()
+
         # Log observation data if enabled
         if self.cfg.observation_visualization.enable:
             env_id = self.cfg.observation_visualization.env_id
