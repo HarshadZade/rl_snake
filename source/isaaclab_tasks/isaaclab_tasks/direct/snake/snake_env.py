@@ -25,6 +25,8 @@ from isaaclab.actuators.actuator_cfg import ImplicitActuatorCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.terrains import TerrainImporter
 
+from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+
 @configclass
 class SnakeEnvCfg(DirectRLEnvCfg):
     # env
@@ -32,7 +34,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     episode_length_s = 50.0
     action_scale = 0.26  # rad/s # Action scale determines how much the target velocity changes per RL step
     action_space = 9    # 9 joints
-    observation_space = 31  # Updated: 9 (joints) + 9 (vels) + 3 (pos) + 4 (quat) + 3 (vel) + 3 (target)
+    observation_space = 21  # Updated: 9 (joints) + 9 (vels) + 3 (target relative position)
     state_space = 0
     link_length = 4.0  #TODO: Get this from the USD instead of hardcoding # Length of each link in meters, used for height termination
 
@@ -47,11 +49,16 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     class TargetPositionCfg:
         """Configuration for target position task."""
         # Target position relative to the root
-        target_pos: tuple = (-1, 0.2, 1)
+        target_pos: tuple = (-1.2, 0.0, 0.8)  # in meters
         # Which link to track for reaching the target (0 is root, higher numbers for other links)
         tracked_link_idx: int = 9  # Default to the 9th link (adjust based on model)
         # Scale for distance threshold (when to consider target reached)
         success_distance_threshold: float = 0.5  # in meters
+        # Visual marker configuration
+        marker_radius: float = 0.1  # Radius of the target sphere in meters
+        marker_color: tuple = (1.0, 0.0, 0.0)  # RGB color (red)
+        # Whether to show the target marker
+        show_marker: bool = False  # Set to False to hide the target marker
 
     target_position: TargetPositionCfg = TargetPositionCfg()
     # -- End Target Position Configuration --
@@ -61,8 +68,8 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     class LQRRewardCfg:
         """Configuration for LQR-style reward function for fixed-base snake robot."""
         # State cost matrix diagonal elements (Q matrix)
-        joint_pos_cost: float = 0.0      # Cost on joint position deviation
-        joint_vel_cost: float = 0.0      # Cost on joint velocity
+        joint_pos_cost: float = 0.01      # Cost on joint position deviation
+        joint_vel_cost: float = 0.01      # Cost on joint velocity
         end_effector_cost: float = 5.0   # Cost on end-effector position deviation from target
         
         # Control cost matrix diagonal elements (R matrix)
@@ -139,7 +146,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
         # Set to True to override RL actions with manual oscillation
         enable_manual_oscillation: bool = False
         # Type of manual oscillation ('sidewinding' or 'constant')
-        oscillation_type: str = 'constant'
+        oscillation_type: str = 'constant'  # 'sidewinding' or 'constant'
         # --- Sidewinding parameters ---
         # Amplitude in degrees (will be converted to radians)
         amplitude_x_deg: float = 30.0  # Amplitude for even joints
@@ -230,22 +237,6 @@ class SnakeEnv(DirectRLEnv):
             else:
                 print(f"[Info] Velocity tracking enabled for Env {self.tracking_env_id}, Joint {self.tracking_joint_id}.")
         
-        # --- Initialize observation history ---
-        self.use_history = self.cfg.observation_history.enable
-        if self.use_history:
-            self.history_length = self.cfg.observation_history.history_length
-            print(f"[Info] Observation history enabled with {self.history_length} frames.")
-            
-            # Calculate the size of a single observation
-            single_obs_size = self._get_single_observation_size()
-            
-            # Initialize the observation history buffer with zeros
-            # Shape: [num_envs, history_length, single_obs_size]
-            self.obs_history = torch.zeros(
-                (self.num_envs, self.history_length, single_obs_size), 
-                device=self.device
-            )
-        
         # Initialize joint position limits
         self.joint_pos_limits = self.snake_robot.data.soft_joint_pos_limits
         self.joint_pos_lower_limits = self.joint_pos_limits[..., 0].to(self.device) # Ellipsis (...) means all preceding dims
@@ -254,10 +245,25 @@ class SnakeEnv(DirectRLEnv):
         self.joint_pos_ranges = self.joint_pos_upper_limits - self.joint_pos_lower_limits + 1e-6
         self.joint_pos_mid = (self.joint_pos_lower_limits + self.joint_pos_upper_limits) / 2
 
-        # Initialize velocity target buffers
+        # Initialize joint velocity targets and previous actions
         self.joint_vel_targets = torch.zeros((self.num_envs, self.snake_robot.num_joints), device=self.device)
         self.prev_actions = torch.zeros((self.num_envs, self.snake_robot.num_joints), device=self.device)
 
+        # Initialize observation history if enabled
+        self.use_observation_history = self.cfg.observation_history.enable
+        if self.use_observation_history:
+            self.history_length = self.cfg.observation_history.history_length
+            print(f"[Info] Observation history enabled with {self.history_length} frames.")
+            
+            # Initialize the observation history buffer with zeros
+            # Shape: [num_envs, history_length, single_obs_size]
+            # Get the size of a single observation using the helper method
+            single_obs_size = self._get_single_observation_size()
+            self.obs_history = torch.zeros(
+                (self.num_envs, self.history_length, single_obs_size), 
+                device=self.device
+            )
+        
         # Cache common data tensors (optional)
         self.joint_pos = self.snake_robot.data.joint_pos
         self.joint_vel = self.snake_robot.data.joint_vel
@@ -268,9 +274,6 @@ class SnakeEnv(DirectRLEnv):
         self.snake_robot = Articulation(self.cfg.robot)
         
         # add ground plane
-        # spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
-        # Spawn the ground plane using the function and config
-        # spawn_ground_plane(prim_path="/World/ground", cfg=self.cfg.ground)
         self.cfg.terrain.num_envs = self.cfg.scene.num_envs
         self.cfg.terrain.env_spacing = self.cfg.scene.env_spacing
         self._terrain = TerrainImporter(self.cfg.terrain)
@@ -284,7 +287,61 @@ class SnakeEnv(DirectRLEnv):
         # add lights
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
+
+        # Setup target visualization markers if enabled
+        if self.cfg.target_position.show_marker:
+            self._setup_target_markers()
+
+    def _setup_target_markers(self):
+        """Setup visualization markers for target positions."""
+        # Configure the visualization markers
+        marker_cfg = VisualizationMarkersCfg(
+            prim_path="/World/Visuals/TargetMarkers",
+            markers={
+                "target": sim_utils.SphereCfg(
+                    radius=self.cfg.target_position.marker_radius,
+                    visual_material=sim_utils.PreviewSurfaceCfg(
+                        diffuse_color=self.cfg.target_position.marker_color
+                    ),
+                ),
+            },
+        )
+        self.target_markers = VisualizationMarkers(marker_cfg)
         
+        # Initialize marker positions and orientations
+        self.marker_positions = torch.zeros((self.num_envs, 3), device=self.device)
+        self.marker_orientations = torch.zeros((self.num_envs, 4), device=self.device)
+        self.marker_orientations[..., 3] = 1.0  # Set to identity quaternion
+        self.marker_indices = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        
+        # Update initial marker positions
+        self._update_target_markers()
+
+    def _update_target_markers(self, env_ids: Sequence[int] | None = None):
+        """Update target marker positions.
+        
+        Args:
+            env_ids: Optional list of environment IDs to update. If None, updates all environments.
+        """
+        if not hasattr(self, 'target_markers'):
+            return
+
+        # Determine which environments to update
+        if env_ids is None:
+            env_ids = range(self.num_envs)
+        
+        # Update marker positions for specified environments
+        for env_idx in env_ids:
+            env_origin = self.scene.env_origins[env_idx]
+            self.marker_positions[env_idx] = env_origin + torch.tensor(self.cfg.target_position.target_pos, device=self.device)
+        
+        # Update visualization
+        self.target_markers.visualize(
+            self.marker_positions,
+            self.marker_orientations,
+            marker_indices=self.marker_indices
+        )
+
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self.env_step_counter += 1
         
@@ -372,13 +429,7 @@ class SnakeEnv(DirectRLEnv):
                 torch.zeros_like(joint_pos),
                 # Scaled joint velocities (shape: num_envs x 9)
                 torch.zeros_like(joint_vel),
-                # Root position (shape: num_envs x 3)
-                torch.zeros((self.num_envs, 3), device=self.device),
-                # Root orientation (shape: num_envs x 4)
-                torch.zeros((self.num_envs, 4), device=self.device),
-                # Root linear velocity (shape: num_envs x 3)
-                torch.zeros((self.num_envs, 3), device=self.device),
-                # Target position (shape: num_envs x 3)
+                # Target position relative to end effector (shape: num_envs x 3)
                 torch.zeros((self.num_envs, 3), device=self.device),
             ),
             dim=-1,
@@ -395,37 +446,31 @@ class SnakeEnv(DirectRLEnv):
         # Calculate joint positions normalized to [-1, 1]
         joint_pos_normalized = 2.0 * (joint_pos - self.joint_pos_lower_limits) / self.joint_pos_ranges - 1.0
         
-        # Get root state information in world frame
-        root_pos_w = self.snake_robot.data.root_pos_w
-        root_quat = self.snake_robot.data.root_quat_w
-        root_lin_vel_w = self.snake_robot.data.root_lin_vel_w
+        # Normalize joint velocities to [-1, 1] based on velocity limits
+        velocity_limit = torch.tensor(self.cfg.robot.actuators["snake_joints"].velocity_limit, 
+                                    device=self.device)
+        joint_vel_normalized = joint_vel / velocity_limit  # This will be in [-1, 1] when velocity is at limits
         
-        # Convert positions from world frame to spawn-relative frame
-        root_pos = root_pos_w - self.scene.env_origins
+        # Get end-effector position in world frame
+        link_positions_w = self.snake_robot.data.body_pos_w  # Shape: [num_envs, num_links, 3]
+        last_link_idx = link_positions_w.shape[1] - 1
+        end_effector_pos = link_positions_w[:, last_link_idx]  # Shape: [num_envs, 3]
         
-        # Use the same spawn-relative frame for velocities
-        # No rotation needed - we want to keep measuring velocity relative to the world axes
-        # just like the position
-        root_lin_vel = root_lin_vel_w  # Keep velocities in world frame orientation
+        # Calculate target position relative to the end effector
+        target_pos_world = self.scene.env_origins + self.target_position.unsqueeze(0)
+        target_pos_relative = target_pos_world - end_effector_pos
         
-        # Calculate target position relative to the robot's current position
-        # This helps the robot understand where the target is in its local frame
-        target_pos_relative = self.target_position.unsqueeze(0).expand(self.num_envs, -1)
-        
-        # Combine observations (current frame only) including target position
+        # Combine observations without root state information
         current_obs = torch.cat(
             (
-                joint_pos_normalized,   # Normalized joint positions
-                joint_vel * 0.1,        # Scaled joint velocities
-                root_pos,               # Root position (spawn-relative frame)
-                root_quat,              # Root orientation
-                root_lin_vel,           # Root linear velocity (world frame orientation)
-                target_pos_relative,    # Target position (relative to root)
+                joint_pos_normalized,   # Normalized joint positions (9)
+                joint_vel_normalized,   # Normalized joint velocities (9)
+                target_pos_relative,    # Target position relative to end effector (3)
             ),
             dim=-1,
         )
         
-        if self.use_history:
+        if self.use_observation_history:
             # Shift the history buffer (discard oldest, make room for newest)
             self.obs_history = self.obs_history.roll(-1, dims=1)
             
@@ -433,13 +478,10 @@ class SnakeEnv(DirectRLEnv):
             self.obs_history[:, -1, :] = current_obs
             
             # Flatten the history for the policy
-            # Shape goes from [num_envs, history_length, single_obs_size] 
-            # to [num_envs, history_length * single_obs_size]
             policy_obs = self.obs_history.reshape(self.num_envs, -1)
             
             observations = {"policy": policy_obs}
         else:
-            # Just use the current observation if history is disabled
             observations = {"policy": current_obs}
         
         # Update logs with tracking and observation data
@@ -581,9 +623,15 @@ class SnakeEnv(DirectRLEnv):
         if len(env_ids) > 0:
             self.target_reached[env_ids] = False
             self.closest_distance[env_ids] = torch.ones(len(env_ids), device=self.device) * 100.0
+            
+            # Update marker positions for reset environments
+            self._update_target_markers(env_ids)
         else:
             self.target_reached = torch.zeros_like(self.target_reached)
             self.closest_distance = torch.ones_like(self.closest_distance) * 100.0
+            
+            # Update all marker positions
+            self._update_target_markers()
         
         # Reset joint positions to a neutral pose with small noise
         n_envs = len(env_ids) if env_ids is not None else self.num_envs
@@ -631,25 +679,30 @@ class SnakeEnv(DirectRLEnv):
             self.prev_actions[env_ids] = joint_vel
             
         # Reset observation history for the reset environments
-        if self.use_history:
-            # Get the current observation for these environments
+        if self.use_observation_history:
+            # Calculate joint positions normalized to [-1, 1]
             joint_pos_normalized = 2.0 * (joint_pos - self.joint_pos_lower_limits[env_ids]) / self.joint_pos_ranges[env_ids] - 1.0
-            root_pos = default_root_state[:, :3]
-            root_quat = default_root_state[:, 3:7]
-            root_lin_vel = torch.zeros_like(root_pos)  # Zero velocity on reset
             
-            # Include target position in the observation
-            target_pos_relative = self.target_position.unsqueeze(0).expand(len(env_ids), -1)
+            # Normalize joint velocities (which are zero at reset)
+            velocity_limit = torch.tensor(self.cfg.robot.actuators["snake_joints"].velocity_limit, 
+                                        device=self.device)
+            joint_vel_normalized = joint_vel / velocity_limit
+            
+            # Get end-effector position in world frame
+            link_positions_w = self.snake_robot.data.body_pos_w[env_ids]  # Shape: [num_reset_envs, num_links, 3]
+            last_link_idx = link_positions_w.shape[1] - 1
+            end_effector_pos = link_positions_w[:, last_link_idx]  # Shape: [num_reset_envs, 3]
+            
+            # Calculate target position relative to the end effector
+            target_pos_world = self.scene.env_origins[env_ids] + self.target_position.unsqueeze(0)
+            target_pos_relative = target_pos_world - end_effector_pos
             
             # Create the initial observation with target position included
             initial_obs = torch.cat(
                 (
-                    joint_pos_normalized,   # Normalized joint positions
-                    joint_vel * 0.1,        # Scaled joint velocities (zeros)
-                    root_pos,               # Fixed root position
-                    root_quat,              # Fixed root orientation
-                    root_lin_vel,           # Zero root velocity (fixed base)
-                    target_pos_relative,    # Target position relative to root
+                    joint_pos_normalized,   # Normalized joint positions (9)
+                    joint_vel_normalized,   # Normalized joint velocities (9)
+                    target_pos_relative,    # Target position relative to end effector (3)
                 ),
                 dim=-1,
             )
@@ -794,7 +847,7 @@ class SnakeEnv(DirectRLEnv):
             
             # Log flattened policy observation
             if "flattened_policy_obs" in self.cfg.observation_visualization.components_to_plot:
-                if self.use_history:
+                if self.use_observation_history:
                     policy_obs = self.obs_history[env_id].reshape(-1)
                 else:
                     policy_obs = obs_dict["policy"][env_id]
