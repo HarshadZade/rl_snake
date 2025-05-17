@@ -7,7 +7,7 @@
 ```./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py --task Isaac-Snake-FixedBase-v0 --headless```
 
 ### For testing: in the top directory
-```./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py --task Isaac-Snake-FixedBase-v0"```
+```./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py --task Isaac-Snake-FixedBase-v0```
 
 ### For tensorboard: in the top directory
 ```./isaaclab.sh -p -m tensorboard.main --logdir=logs```
