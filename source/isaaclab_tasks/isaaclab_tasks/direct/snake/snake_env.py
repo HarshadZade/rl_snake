@@ -144,7 +144,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     class TestingCfg:
         """Configuration for testing modes."""
         # Set to True to override RL actions with manual oscillation
-        enable_manual_oscillation: bool = True
+        enable_manual_oscillation: bool = False
         # Type of manual oscillation ('sidewinding' or 'constant')
         oscillation_type: str = 'sidewinding'  # 'sidewinding' or 'constant'
         # --- Sidewinding parameters ---
