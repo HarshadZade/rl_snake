@@ -49,16 +49,16 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     class TargetPositionCfg:
         """Configuration for target position task."""
         # Target position relative to the root
-        target_pos: tuple = (-1.2, 0.0, 0.8)  # in meters
+        target_pos: tuple = (-1.2, 0.0, 0.8)  # in meters (-1.8, 0, 0) in local frame
         # Which link to track for reaching the target (0 is root, higher numbers for other links)
         tracked_link_idx: int = 9  # Default to the 9th link (adjust based on model)
         # Scale for distance threshold (when to consider target reached)
-        success_distance_threshold: float = 0.5  # in meters
+        success_distance_threshold: float = 0.1  # in meters
         # Visual marker configuration
         marker_radius: float = 0.1  # Radius of the target sphere in meters
         marker_color: tuple = (1.0, 0.0, 0.0)  # RGB color (red)
         # Whether to show the target marker
-        show_marker: bool = False  # Set to False to hide the target marker
+        show_marker: bool = True  # Set to False to hide the target marker
 
     target_position: TargetPositionCfg = TargetPositionCfg()
     # -- End Target Position Configuration --
@@ -102,7 +102,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
             joint_pos={
                 "joint_1": 0.0,
             },
-            pos=(0.0, 0.0, 0.0375),  # Initial base position (adjust height based on robot)
+            pos=(0.0, 0.0, 0.0375),  # Initial base position (adjust height based on robot) 0.15, 0.075, 0.075 m
             rot=(0.0, 0.0, 0.0, 1.0), # Initial base orientation
         ),
         actuators={
@@ -136,17 +136,17 @@ class SnakeEnvCfg(DirectRLEnvCfg):
         debug_vis=False,
     )
 
-    # reset
-    joint_angle_range = [-1.57, 1.57] # rad
+    # # reset
+    # joint_angle_range = [-1.57, 1.57] # rad
 
     # -- Testing Configuration --
     @configclass
     class TestingCfg:
         """Configuration for testing modes."""
         # Set to True to override RL actions with manual oscillation
-        enable_manual_oscillation: bool = False
+        enable_manual_oscillation: bool = True
         # Type of manual oscillation ('sidewinding' or 'constant')
-        oscillation_type: str = 'constant'  # 'sidewinding' or 'constant'
+        oscillation_type: str = 'sidewinding'  # 'sidewinding' or 'constant'
         # --- Sidewinding parameters ---
         # Amplitude in degrees (will be converted to radians)
         amplitude_x_deg: float = 30.0  # Amplitude for even joints
@@ -581,35 +581,16 @@ class SnakeEnv(DirectRLEnv):
         out_of_bounds = torch.any(self.joint_pos < self.joint_pos_lower_limits, dim=1) | \
                         torch.any(self.joint_pos > self.joint_pos_upper_limits, dim=1)
         
-        # Get velocity limit violations - using limit from actuator config
-        joint_vel = self.snake_robot.data.joint_vel
-        velocity_limit = torch.tensor(self.cfg.robot.actuators["snake_joints"].velocity_limit, 
-                                    device=self.device)
-        vel_violation = torch.any(torch.abs(joint_vel) > velocity_limit, dim=1)
-        
-        # Get torque limit violations - using limit from actuator config
-        joint_torques = self.snake_robot.data.applied_torque
-        torque_limit = torch.tensor(self.cfg.robot.actuators["snake_joints"].effort_limit, 
-                                  device=self.device)
-        torque_violation = torch.any(torch.abs(joint_torques) > torque_limit, dim=1)
-        
         # Combine all termination conditions
-        terminated = out_of_bounds | vel_violation | torque_violation
-        
+        # terminated = out_of_bounds | vel_violation | torque_violation
+        terminated = out_of_bounds 
         if "log" not in self.extras:  # Initialize if not present
             self.extras["log"] = {}
     
         # Add termination info to extras["log"]
         self.extras["log"].update({
             "terminations/joint_out_of_bounds": torch.sum(out_of_bounds).item(),
-            "terminations/velocity_violations": torch.sum(vel_violation).item(),
-            "terminations/torque_violations": torch.sum(torque_violation).item(),
-            # Log max values for debugging
-            "terminations/max_velocity": torch.max(torch.abs(joint_vel)).item(),
-            "terminations/max_torque": torch.max(torch.abs(joint_torques)).item(),
-            # Log the actual limits being used
-            "terminations/velocity_limit": self.cfg.robot.actuators["snake_joints"].velocity_limit,
-            "terminations/torque_limit": self.cfg.robot.actuators["snake_joints"].effort_limit,
+            "terminations/time_out": torch.sum(time_out).item(),
         })
         
         return terminated, time_out
