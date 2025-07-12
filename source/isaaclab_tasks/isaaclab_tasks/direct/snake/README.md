@@ -1,4 +1,5 @@
 ## IsaacLab Snake Task
+IsaacLab Tag: [`v2.1.0`](https://github.com/isaac-sim/IsaacLab/tree/v2.1.0)
 
 ### Directory Structure
 
@@ -34,7 +35,7 @@ From the top-level directory, run:
 
 From the top-level directory, run:
 ```bash
-./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py --task Isaac-Snake-FixedBase-v0
+./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py --task Isaac-Snake-FixedBase-v0 --num_envs 1
 ```
 
 ### TensorBoard

@@ -4,9 +4,9 @@ on:
   push:
     branches:
       - main
-      - devel
   pull_request:
-    types: [opened, synchronize, reopened]
+    branches:
+      - main
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
