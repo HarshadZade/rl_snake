@@ -1,4 +1,10 @@
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
 from isaaclab.utils import configclass
+
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg
 
 
@@ -9,7 +15,7 @@ class SnakePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     save_interval = 50
     experiment_name = "Isaac-Snake-FixedBase-v0"
     empirical_normalization = False
-    
+
     # Neural network configuration
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
@@ -17,7 +23,7 @@ class SnakePPORunnerCfg(RslRlOnPolicyRunnerCfg):
         critic_hidden_dims=[256, 128, 64],
         activation="elu",
     )
-    
+
     # PPO algorithm parameters
     algorithm = RslRlPpoAlgorithmCfg(
         value_loss_coef=1.0,

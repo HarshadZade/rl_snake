@@ -88,7 +88,9 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     robot: ArticulationCfg = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot",  # Standard prim path pattern
         spawn=sim_utils.UsdFileCfg(
-            usd_path="./source/isaaclab_tasks/isaaclab_tasks/direct/snake/usd_files/snake_realistic_dim_v0.usd",
+            usd_path=(
+                "./source/isaaclab_tasks/isaaclab_tasks/direct/snake/usd_files/snake_realistic_floating_dim_v0.usda"
+            ),
             activate_contact_sensors=False,  # Set to True if you need contact sensors #TODO: check this
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=False,

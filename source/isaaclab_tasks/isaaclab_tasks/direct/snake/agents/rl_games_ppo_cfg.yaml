@@ -44,7 +44,7 @@ params:
     normalize_value: True
     value_bootstrap: True
     num_actors: 4096
-    device: "cuda:0" 
+    device: "cuda:0"
     reward_shaper:
       scale_value: 0.01
     normalize_advantage: True

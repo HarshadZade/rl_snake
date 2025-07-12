@@ -16,6 +16,7 @@
 
 # Unignore USD files for snake
 !source/isaaclab_tasks/isaaclab_tasks/direct/snake/usd_files/*.usd
+!source/isaaclab_tasks/isaaclab_tasks/direct/snake/usd_files/*.usda
 
 # Python
 .DS_Store
