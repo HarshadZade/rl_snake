@@ -14,6 +14,9 @@
 **/*.usdc
 **/*.usdz
 
+# Unignore USD files for snake
+!source/isaaclab_tasks/isaaclab_tasks/direct/snake/usd_files/*.usd
+
 # Python
 .DS_Store
 **/*.egg-info/
@@ -61,5 +64,8 @@ _build
 # Pre-Trained Checkpoints
 /.pretrained_checkpoints/
 
-# Teleop Recorded Dataset
-datasets
+# Misc.
+joint_tracking_plots/*
+logs_bak/*
+observation_plots/*
+root_position_debug/*
