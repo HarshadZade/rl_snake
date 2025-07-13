@@ -42,6 +42,9 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=4.0, replicate_physics=True)
 
+    # Set to True to override RL actions with oscillation control
+    enable_oscillation_controller: bool = True
+
     # -- Target Position Configuration --
     @configclass
     class TargetPositionCfg:
@@ -146,8 +149,6 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     class TestingCfg:
         """Configuration for testing modes."""
 
-        # Set to True to override RL actions with manual oscillation
-        enable_manual_oscillation: bool = False
         # Type of manual oscillation ('sidewinding' or 'constant')
         oscillation_type: str = "sidewinding"  # 'sidewinding' or 'constant'
         # --- Sidewinding parameters ---

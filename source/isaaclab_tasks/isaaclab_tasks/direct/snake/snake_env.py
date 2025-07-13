@@ -15,6 +15,7 @@ from isaaclab.envs import DirectRLEnv
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.terrains import TerrainImporter
 
+from .oscillation_controller import OscillationController
 from .snake_env_cfg import SnakeEnvCfg
 
 
@@ -70,6 +71,13 @@ class SnakeEnv(DirectRLEnv):
         # Initialize joint velocity targets and previous actions
         self.joint_vel_targets = torch.zeros((self.num_envs, self.snake_robot.num_joints), device=self.device)
         self.prev_actions = torch.zeros((self.num_envs, self.snake_robot.num_joints), device=self.device)
+
+        # Initialize oscillation controller if enabled
+        if self.cfg.enable_oscillation_controller:
+            self.oscillation_controller = OscillationController(
+                cfg=self.cfg.testing, num_joints=self.snake_robot.num_joints, device=self.device
+            )
+            print(f"[Info] Oscillation controller initialized with pattern: {self.cfg.testing.oscillation_type}")
 
         # Initialize observation history if enabled
         self.use_observation_history = self.cfg.observation_history.enable
@@ -165,74 +173,42 @@ class SnakeEnv(DirectRLEnv):
         # Store action for smoothness calculations in reward
         self.prev_actions = self.joint_vel_targets.clone()
 
-        # Check if manual oscillation test mode is enabled
-        if self.cfg.testing.enable_manual_oscillation:
-            # Create tensor to hold velocity targets
-            num_joints = self.snake_robot.num_joints
-            velocity_targets = torch.zeros((num_joints,), device=self.device)
-
-            if self.cfg.testing.oscillation_type == "sidewinding":
-                # --- SIDEWINDING MOTION PATTERN ---
-                current_time = self.sim.current_time
-
-                # Parameters from config
-                # Convert amplitude from degrees to radians
-                amplitude_x_rad = math.radians(self.cfg.testing.amplitude_x_deg)
-                amplitude_y_rad = math.radians(self.cfg.testing.amplitude_y_deg)
-
-                # Angular frequencies
-                omega_x = self.cfg.testing.omega_x
-                omega_y = self.cfg.testing.omega_y
-
-                # Phase offsets
-                delta_x = self.cfg.testing.delta_x
-                delta_y = self.cfg.testing.delta_y
-
-                # Phase difference between patterns
-                phi = self.cfg.testing.phi
-
-                # Calculate velocity for each joint (derivative of position function)
-                for i in range(num_joints):
-                    if i % 2 == 0:  # Even joints
-                        # velocity(n,t) = Ax * wx * cos(wx*t + n*deltax)
-                        velocity_targets[i] = (
-                            amplitude_x_rad * omega_x * torch.cos(torch.tensor(omega_x * current_time + i * delta_x))
-                        )
-                    else:  # Odd joints
-                        # velocity(n,t) = Ay * wy * cos(wy*t + n*deltay + phi)
-                        velocity_targets[i] = (
-                            amplitude_y_rad
-                            * omega_y
-                            * torch.cos(torch.tensor(omega_y * current_time + i * delta_y + phi))
-                        )
-
-            elif self.cfg.testing.oscillation_type == "constant":
-                # Set all joints to the same constant velocity
-                velocity_targets.fill_(self.cfg.testing.constant_velocity)
-
-            else:
-                raise ValueError(f"Unknown oscillation type: {self.cfg.testing.oscillation_type}")
-
-            # Expand to all environments
-            self.joint_vel_targets[:] = velocity_targets.unsqueeze(0).expand(self.num_envs, -1)
-
-            # Set self.actions for potential use in reward calculations
-            self.actions = torch.zeros_like(actions)
-
+        # Choose between oscillation control or policy control
+        if self.cfg.enable_oscillation_controller:
+            self._apply_oscillation_control(actions)
         else:
-            # Process actions from the policy for VELOCITY CONTROL
-            self.actions = actions.clone().clamp_(-1.0, 1.0)
+            self._apply_policy_control(actions)
 
-            # Scale normalized actions to velocity targets
-            # Map [-1, 1] to desired velocity range using action_scale
-            velocity_targets = self.action_scale * self.actions
+    def _apply_oscillation_control(self, actions: torch.Tensor) -> None:
+        """Apply oscillation patterns for testing snake locomotion."""
+        # Generate velocity targets using the oscillation controller
+        current_time = self.sim.current_time
+        velocity_targets = self.oscillation_controller.generate_velocity_targets(current_time)
 
-            # Set joint velocity targets directly - no need to accumulate like position
-            self.joint_vel_targets[:] = velocity_targets
+        # Apply to all environments
+        self.joint_vel_targets[:] = velocity_targets.unsqueeze(0).expand(self.num_envs, -1)
+
+        # Set zero actions for reward calculations
+        self.actions = torch.zeros_like(actions)
+
+    def _apply_policy_control(self, actions: torch.Tensor) -> None:
+        """Apply velocity control based on policy actions.
+
+        Args:
+            actions: Policy actions in range [-1, 1]. Shape: [num_envs, num_joints]
+        """
+        # Process and clamp actions
+        self.actions = actions.clone().clamp_(-1.0, 1.0)
+
+        # Scale normalized actions to velocity targets
+        # Map [-1, 1] to desired velocity range using action_scale
+        velocity_targets = self.action_scale * self.actions
+
+        # Set joint velocity targets directly
+        self.joint_vel_targets[:] = velocity_targets
 
     def _apply_action(self) -> None:
         # Use velocity control instead of position control
-        # self.joint_vel_targets[:] = 0.0
         self.snake_robot.set_joint_velocity_target(self.joint_vel_targets)
 
     def _get_single_observation_size(self):
