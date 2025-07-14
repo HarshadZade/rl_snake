@@ -26,26 +26,28 @@ class SnakeEnv(DirectRLEnv):
         super().__init__(cfg, render_mode, **kwargs)
         self._render = render_mode is not None
 
-        self.action_scale = self.cfg.action_scale
         self.env_step_counter = 0
 
         # Define which link to track for target reaching
-        self.tracked_link_idx = torch.tensor([self.cfg.target_position.tracked_link_idx], device=self.device)
+        # self.tracked_link_idx = torch.tensor([self.cfg.target_position.tracked_link_idx], device=self.device)
 
-        # Store target position
+        # Store target position, used in:
+        # 1. Constructing observation
+        # 2. Reward function
+        # 3. Reset (TODO: optionally, can vary)
         self.target_position = torch.tensor(self.cfg.target_position.target_pos, device=self.device)
 
-        # Add a buffer to track whether each environment has reached the target
+        # Add a buffer to track whether each environment has reached the target, used in:
+        # 1. Reward function
         self.target_reached = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
 
         # Track closest distance to target for each environment (initialize with large value)
+        # Updated in:
+        # 1. Reward Function
+        # 2. Reset
         self.closest_distance = torch.ones(self.num_envs, device=self.device) * 100.0
 
-        # Print debug info about links at the first step
-        self.printed_link_debug = False
-
-        self.track_positions = self.cfg.position_tracking.enable
-        if self.track_positions:
+        if self.cfg.position_tracking.enable:
             self.tracking_env_id = self.cfg.position_tracking.env_id
             self.tracking_joint_id = self.cfg.position_tracking.joint_id
             self.track_all_joints = self.cfg.position_tracking.track_all_joints
@@ -202,7 +204,7 @@ class SnakeEnv(DirectRLEnv):
 
         # Scale normalized actions to velocity targets
         # Map [-1, 1] to desired velocity range using action_scale
-        velocity_targets = self.action_scale * self.actions
+        velocity_targets = self.cfg.action_scale * self.actions
 
         # Set joint velocity targets directly
         self.joint_vel_targets[:] = velocity_targets
@@ -333,9 +335,6 @@ class SnakeEnv(DirectRLEnv):
         newly_reached = (distance_to_target < threshold) & (~self.target_reached)
         self.target_reached = self.target_reached | newly_reached
 
-        # Update closest distance tracker
-        self.closest_distance = torch.minimum(self.closest_distance, distance_to_target)
-
         # Success bonus for reaching target
         success_bonus = torch.zeros_like(distance_to_target)
         success_bonus[newly_reached] = self.cfg.lqr_reward.success_bonus
@@ -348,6 +347,9 @@ class SnakeEnv(DirectRLEnv):
         total_reward = -(state_cost + control_cost) + success_bonus + alive_bonus
 
         # Update logs
+        # Update closest distance tracker
+        self.closest_distance = torch.minimum(self.closest_distance, distance_to_target)
+
         self.extras["log"].update({
             "Rewards/joint_pos_cost": joint_pos_cost.mean().item(),
             "Rewards/joint_vel_cost": joint_vel_cost.mean().item(),
@@ -484,49 +486,62 @@ class SnakeEnv(DirectRLEnv):
                     self.obs_history[env_ids, t, :] = initial_obs
 
     def _update_logs(self, obs_dict: dict) -> None:
-        """Update logs with tracking and observation data."""
+        """Updates and logs various metrics for debugging and analysis."""
+        self._log_tracking_data()
+        self._log_last_link_data()
+        self._log_mass_information()
+        self._log_torque_data()
+        self._log_observation_data(obs_dict)
+
+    def _log_tracking_data(self) -> None:
+        """Logs joint position tracking data when enabled."""
+        if not self.cfg.position_tracking.enable:
+            return
+
         # Initialize log dict if not present
         if "log" not in self.extras:
             self.extras["log"] = {}
 
-        # Log tracking data if enabled
-        if self.cfg.position_tracking.enable:
-            env_id = self.cfg.position_tracking.env_id
-            if self.track_all_joints:
-                # Initialize sum for average calculation
-                total_abs_error = 0.0
+        env_id = self.cfg.position_tracking.env_id
+        if self.track_all_joints:
+            # Initialize sum for average calculation
+            total_abs_error = 0.0
 
-                # Log commanded and actual velocities for each joint
-                for joint_idx in range(self.snake_robot.num_joints):
-                    commanded_vel = self.joint_vel_targets[env_id, joint_idx]
-                    actual_vel = self.snake_robot.data.joint_vel[env_id, joint_idx]
+            # Log commanded and actual velocities for each joint
+            for joint_idx in range(self.snake_robot.num_joints):
+                commanded_vel = self.joint_vel_targets[env_id, joint_idx]
+                actual_vel = self.snake_robot.data.joint_vel[env_id, joint_idx]
 
-                    self.extras["log"].update({
-                        f"Tracking/Joint{joint_idx}/CommandedVelocity": commanded_vel.item(),
-                        f"Tracking/Joint{joint_idx}/ActualVelocity": actual_vel.item(),
-                    })
-                    # Calculate and log error metrics
-                    error = commanded_vel - actual_vel
-                    abs_error = abs(error.item())
-                    total_abs_error += abs_error
+                self.extras["log"].update({
+                    f"Tracking/Joint{joint_idx}/CommandedVelocity": commanded_vel.item(),
+                    f"Tracking/Joint{joint_idx}/ActualVelocity": actual_vel.item(),
+                })
+                # Calculate and log error metrics
+                error = commanded_vel - actual_vel
+                abs_error = abs(error.item())
+                total_abs_error += abs_error
 
-                    self.extras["log"].update({
-                        f"Tracking/Joint{joint_idx}/Error": error.item(),
-                        f"Tracking/Joint{joint_idx}/AbsError": abs_error,
-                    })
+                self.extras["log"].update({
+                    f"Tracking/Joint{joint_idx}/Error": error.item(),
+                    f"Tracking/Joint{joint_idx}/AbsError": abs_error,
+                })
 
-                # Calculate and log average absolute error across all joints
-                avg_abs_error = total_abs_error / self.snake_robot.num_joints
-                self.extras["log"]["Tracking/AverageAbsoluteError"] = avg_abs_error
+            # Calculate and log average absolute error across all joints
+            avg_abs_error = total_abs_error / self.snake_robot.num_joints
+            self.extras["log"]["Tracking/AverageAbsoluteError"] = avg_abs_error
 
-        # Track last link position
+    def _log_last_link_data(self) -> None:
+        """Logs position data for the last link of the snake."""
+        # Initialize log dict if not present
+        if "log" not in self.extras:
+            self.extras["log"] = {}
+
         # Get all link positions in world frame
         link_positions_w = self.snake_robot.data.body_pos_w  # Shape: [num_envs, num_links, 3]
         last_link_idx = link_positions_w.shape[1] - 1  # Get the index of the last link
 
         # Get position of last link for the visualization environment
         env_id = self.cfg.observation_visualization.env_id if self.cfg.observation_visualization.enable else 0
-        # env_id = 3012
         last_link_pos_world = link_positions_w[env_id, last_link_idx]  # Shape: [3]
 
         # Get root position in world frame
@@ -561,7 +576,12 @@ class SnakeEnv(DirectRLEnv):
         self.extras["log"]["LastLink/Relative/DistanceFromBase"] = relative_distance
         self.extras["log"]["LastLink/Relative/PlanarDistance"] = relative_planar_distance
 
-        # Log mass information
+    def _log_mass_information(self) -> None:
+        """Logs mass information for individual links and total mass."""
+        # Initialize log dict if not present
+        if "log" not in self.extras:
+            self.extras["log"] = {}
+
         # Get masses for all links
         link_masses = self.snake_robot.data.default_mass  # Shape: [num_envs, num_bodies]
         total_mass = torch.sum(link_masses, dim=1)  # Shape: [num_envs]
@@ -576,62 +596,76 @@ class SnakeEnv(DirectRLEnv):
         # Log total mass
         self.extras["log"]["Masses/TotalRobotMass"] = total_mass[env_id].item()
 
-        # Log actuator torques
+    def _log_torque_data(self) -> None:
+        """Logs computed and applied torque data for joints."""
+        # Initialize log dict if not present
+        if "log" not in self.extras:
+            self.extras["log"] = {}
+
+        # Get torque data
         joint_torques_computed = self.snake_robot.data.computed_torque  # Shape: [num_envs, num_joints]
         joint_torques_applied = self.snake_robot.data.applied_torque  # Shape: [num_envs, num_joints]
+
+        # Get environment ID for logging
+        env_id = self.cfg.observation_visualization.env_id if self.cfg.observation_visualization.enable else 0
 
         # Log torques for each joint
         for joint_idx in range(self.snake_robot.num_joints):
             self.extras["log"][f"Torques/Joint{joint_idx}/computed"] = joint_torques_computed[env_id, joint_idx].item()
             self.extras["log"][f"Torques/Joint{joint_idx}/applied"] = joint_torques_applied[env_id, joint_idx].item()
 
-        # Log observation data if enabled
-        if self.cfg.observation_visualization.enable:
-            env_id = self.cfg.observation_visualization.env_id
+    def _log_observation_data(self, obs_dict: dict) -> None:
+        """Logs observation data for visualization when enabled."""
+        if not self.cfg.observation_visualization.enable:
+            return
 
-            # Log joint positions and velocities
-            if "joint_pos" in self.cfg.observation_visualization.components_to_plot:
-                for joint_idx in range(self.snake_robot.num_joints):
-                    self.extras["log"][f"Observations/Joint{joint_idx}/Position"] = self.snake_robot.data.joint_pos[
-                        env_id, joint_idx
-                    ].item()
+        # Initialize log dict if not present
+        if "log" not in self.extras:
+            self.extras["log"] = {}
 
-            if "joint_vel" in self.cfg.observation_visualization.components_to_plot:
-                for joint_idx in range(self.snake_robot.num_joints):
-                    self.extras["log"][f"Observations/Joint{joint_idx}/Velocity"] = self.snake_robot.data.joint_vel[
-                        env_id, joint_idx
-                    ].item()
+        env_id = self.cfg.observation_visualization.env_id
 
-            # Log root position (world and local frame)
-            if "root_pos" in self.cfg.observation_visualization.components_to_plot:
-                for i, axis in enumerate(["X", "Y", "Z"]):
-                    self.extras["log"].update({
-                        f"Observations/Root/WorldPosition{axis}": self.snake_robot.data.root_pos_w[env_id, i].item(),
-                        f"Observations/Root/LocalPosition{axis}": self.snake_robot.data.root_link_pos_w[
-                            env_id, i
-                        ].item(),
-                    })
+        # Log joint positions and velocities
+        if "joint_pos" in self.cfg.observation_visualization.components_to_plot:
+            for joint_idx in range(self.snake_robot.num_joints):
+                self.extras["log"][f"Observations/Joint{joint_idx}/Position"] = self.snake_robot.data.joint_pos[
+                    env_id, joint_idx
+                ].item()
 
-            # Log root linear velocity
-            if "root_lin_vel" in self.cfg.observation_visualization.components_to_plot:
-                for i, axis in enumerate(["X", "Y", "Z"]):
-                    self.extras["log"][f"Observations/Root/LinearVelocity{axis}"] = (
-                        self.snake_robot.data.root_lin_vel_w[env_id, i].item()
-                    )
+        if "joint_vel" in self.cfg.observation_visualization.components_to_plot:
+            for joint_idx in range(self.snake_robot.num_joints):
+                self.extras["log"][f"Observations/Joint{joint_idx}/Velocity"] = self.snake_robot.data.joint_vel[
+                    env_id, joint_idx
+                ].item()
 
-            # Log root orientation (quaternion)
-            if "root_quat" in self.cfg.observation_visualization.components_to_plot:
-                for i, component in enumerate(["W", "X", "Y", "Z"]):
-                    self.extras["log"][f"Observations/Root/Quaternion{component}"] = self.snake_robot.data.root_quat_w[
-                        env_id, i
-                    ].item()
+        # Log root position (world and local frame)
+        if "root_pos" in self.cfg.observation_visualization.components_to_plot:
+            for i, axis in enumerate(["X", "Y", "Z"]):
+                self.extras["log"].update({
+                    f"Observations/Root/WorldPosition{axis}": self.snake_robot.data.root_pos_w[env_id, i].item(),
+                    f"Observations/Root/LocalPosition{axis}": self.snake_robot.data.root_link_pos_w[env_id, i].item(),
+                })
 
-            # Log flattened policy observation
-            if "flattened_policy_obs" in self.cfg.observation_visualization.components_to_plot:
-                if self.use_observation_history:
-                    policy_obs = self.obs_history[env_id].reshape(-1)
-                else:
-                    policy_obs = obs_dict["policy"][env_id]
+        # Log root linear velocity
+        if "root_lin_vel" in self.cfg.observation_visualization.components_to_plot:
+            for i, axis in enumerate(["X", "Y", "Z"]):
+                self.extras["log"][f"Observations/Root/LinearVelocity{axis}"] = self.snake_robot.data.root_lin_vel_w[
+                    env_id, i
+                ].item()
 
-                for i in range(len(policy_obs)):
-                    self.extras["log"][f"Observations/PolicyObs/Dim{i}"] = policy_obs[i].item()
+        # Log root orientation (quaternion)
+        if "root_quat" in self.cfg.observation_visualization.components_to_plot:
+            for i, component in enumerate(["W", "X", "Y", "Z"]):
+                self.extras["log"][f"Observations/Root/Quaternion{component}"] = self.snake_robot.data.root_quat_w[
+                    env_id, i
+                ].item()
+
+        # Log flattened policy observation
+        if "flattened_policy_obs" in self.cfg.observation_visualization.components_to_plot:
+            if self.use_observation_history:
+                policy_obs = self.obs_history[env_id].reshape(-1)
+            else:
+                policy_obs = obs_dict["policy"][env_id]
+
+            for i in range(len(policy_obs)):
+                self.extras["log"][f"Observations/PolicyObs/Dim{i}"] = policy_obs[i].item()
