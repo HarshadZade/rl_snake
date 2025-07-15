@@ -35,7 +35,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     episode_length_s = 50.0
 
     # Action scale determines how much the target velocity changes per RL step
-    action_scale = 0.26  # rad/s
+    action_scale = 2.6  # rad/s
     action_space = 9  # 9 joints
     observation_space = 21  # Updated: 9 (joints) + 9 (vels) + 3 (target relative position)
     state_space = 0
