@@ -31,6 +31,11 @@ From the top-level directory, run:
 ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py --task Isaac-Snake-FixedBase-v0 --headless
 ```
 
+To resume training from last checkpoint, use:
+```bash
+./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py --task Isaac-Snake-FixedBase-v0 --headless --resume
+```
+
 ### Testing
 
 From the top-level directory, run:
