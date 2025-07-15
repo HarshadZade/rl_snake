@@ -47,6 +47,7 @@ class SnakeEnv(DirectRLEnv):
         # 2. Reset
         self.closest_distance = torch.ones(self.num_envs, device=self.device) * 100.0
 
+        # Tracking initializations
         if self.cfg.position_tracking.enable:
             self.tracking_env_id = self.cfg.position_tracking.env_id
             self.tracking_joint_id = self.cfg.position_tracking.joint_id
@@ -61,14 +62,14 @@ class SnakeEnv(DirectRLEnv):
                 )
 
         # Initialize joint position limits
-        self.joint_pos_limits = self.snake_robot.data.soft_joint_pos_limits
-        self.joint_pos_lower_limits = self.joint_pos_limits[..., 0].to(
+        joint_pos_limits = self.snake_robot.data.soft_joint_pos_limits
+        self.joint_pos_lower_limits = joint_pos_limits[..., 0].to(
             self.device
         )  # Ellipsis (...) means all preceding dims
-        self.joint_pos_upper_limits = self.joint_pos_limits[..., 1].to(self.device)
+        self.joint_pos_upper_limits = joint_pos_limits[..., 1].to(self.device)
 
+        # Get joint position range for normalization
         self.joint_pos_ranges = self.joint_pos_upper_limits - self.joint_pos_lower_limits + 1e-6
-        self.joint_pos_mid = (self.joint_pos_lower_limits + self.joint_pos_upper_limits) / 2
 
         # Initialize joint velocity targets and previous actions
         self.joint_vel_targets = torch.zeros((self.num_envs, self.snake_robot.num_joints), device=self.device)
