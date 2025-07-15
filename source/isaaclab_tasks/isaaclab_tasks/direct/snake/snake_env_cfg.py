@@ -21,6 +21,16 @@ from isaaclab.utils import configclass
 class SnakeEnvCfg(DirectRLEnvCfg):
     """Configuration for the snake robot environment."""
 
+    # Base configuration for snake robot
+    fixed_base = True
+
+    # Set to True to override RL actions with oscillation controller for floating snake robot
+    enable_oscillation_controller: bool = True
+
+    # Disable the controller if using fixed base
+    if fixed_base:
+        enable_oscillation_controller = False
+
     # Length of each episode in seconds
     episode_length_s = 50.0
 
@@ -41,9 +51,6 @@ class SnakeEnvCfg(DirectRLEnvCfg):
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=4.0, replicate_physics=True)
-
-    # Set to True to override RL actions with oscillation control
-    enable_oscillation_controller: bool = True
 
     # -- Target Position Configuration --
     @configclass
@@ -84,13 +91,16 @@ class SnakeEnvCfg(DirectRLEnvCfg):
 
     lqr_reward: LQRRewardCfg = LQRRewardCfg()
 
+    if fixed_base:
+        usd_path = "./source/isaaclab_tasks/isaaclab_tasks/direct/snake/usd_files/snake_realistic_fixed_dim_v0.usda"
+    else:
+        usd_path = "./source/isaaclab_tasks/isaaclab_tasks/direct/snake/usd_files/snake_realistic_floating_dim_v0.usda"
+
     # -- Robot Configuration (Loading from USD)
     robot: ArticulationCfg = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot",  # Standard prim path pattern
         spawn=sim_utils.UsdFileCfg(
-            usd_path=(
-                "./source/isaaclab_tasks/isaaclab_tasks/direct/snake/usd_files/snake_realistic_floating_dim_v0.usda"
-            ),
+            usd_path=usd_path,
             activate_contact_sensors=False,  # Set to True if you need contact sensors #TODO: check this
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=False,
