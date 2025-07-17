@@ -99,6 +99,9 @@ class SnakeEnv(DirectRLEnv):
         # Initialize frame visualization for virtual chassis
         self._setup_virtual_chassis_frame_markers()
 
+        # Initialize previous rotation matrix for virtual chassis sign consistency
+        self.prev_virtual_chassis_rot_mat = torch.zeros((self.num_envs, 3, 3), device=self.device, dtype=torch.float32)
+
         # Cache common data tensors (optional)
         self.joint_pos = self.snake_robot.data.joint_pos
         self.joint_vel = self.snake_robot.data.joint_vel
@@ -207,20 +210,15 @@ class SnakeEnv(DirectRLEnv):
 
         # Update frame marker positions and orientations for each environment
         for env_idx in range(self.num_envs):
-            vc_position = self.virtual_chasis_com_world[env_idx]  # Virtual chassis center in world
-            vc_rotation = self.virtual_chasis_rot_mat[env_idx]  # Virtual chassis rotation in world
+            vc_position = self.virtual_chassis_com_world[env_idx]  # Virtual chassis center in world
+            vc_rotation = self.virtual_chassis_rot_mat[env_idx]  # Virtual chassis rotation in world
 
             # Convert rotation matrix to quaternion for the frame marker
             vc_quaternion = quat_from_matrix(vc_rotation)
 
-            env_origin = self.scene.env_origins[env_idx]
-
             # Update position and orientation for this environment's frame marker
             self.axis_positions[env_idx] = vc_position
             self.axis_orientations[env_idx] = vc_quaternion
-            # Print center of mass data for debugging
-            print(f"[Debug] Env {env_idx}: Origin: ", env_origin)
-            print(f"[Debug] Env {env_idx}: Virtual chassis: ", self.axis_positions[env_idx])
 
         # Update the visualization
         self.virtual_chassis_axes.visualize(
@@ -296,7 +294,7 @@ class SnakeEnv(DirectRLEnv):
         return single_obs.shape[-1]
 
     def _get_observations(self) -> dict:
-        # Updates the virtual chasis com and rotation matrix
+        # Updates the virtual chassis com and rotation matrix
         self._compute_virtual_chassis()
 
         # Get joint positions and velocities
@@ -762,66 +760,69 @@ class SnakeEnv(DirectRLEnv):
         The virtual chassis is defined as a body frame whose origin is at the robot's center
         of mass and whose axes are aligned with the robot's principal moments of inertia.
 
-        Args:
-            link_positions_root_frame: [num_envs, num_links, 3] - Link frame positions relative to root frame
-            prev_rotation_matrix: [num_envs, 3, 3] - Previous rotation matrix to prevent sign flips
-            use_mass_weighted_com: If True, uses actual mass-weighted COM; if False, uses geometric centroid
+        The method computes:
+        - self.virtual_chassis_com_world: [num_envs, 3] - Center of mass position in world frame
+        - self.virtual_chassis_rot_mat: [num_envs, 3, 3] - Virtual chassis rotation matrix in world frame
 
-        Returns:
-            rotation_matrix: [num_envs, 3, 3] - Virtual chassis rotation matrix relative to root frame
-            center_of_mass: [num_envs, 3] - Center of mass position relative to root frame
+        The rotation matrix represents the orientation of the virtual chassis frame relative to
+        the world coordinate system, where the axes are aligned with the principal directions
+        of the robot's link distribution.
         """
         # Step 1: Compute center of mass of all links
         center_of_mass_world = self._compute_mass_weighted_com_world_frame()  # [num_envs, 3]
 
         # Ensure center_of_mass is on correct device
-        self.virtual_chasis_com_world = center_of_mass_world.to(self.device)
+        self.virtual_chassis_com_world = center_of_mass_world.to(self.device)
 
-        # Step 2: Create position matrix P relative to center of mass
-        # P[i] = link_positions[i] - center_of_mass for each environment
-        # P = link_positions_root_frame - center_of_mass.unsqueeze(1)  # [num_envs, num_links, 3]
+        # Step 2: Get link positions in world frame and create position matrix P relative to center of mass
+        link_positions_w = self.snake_robot.data.body_pos_w.to(self.device)  # [num_envs, num_links, 3]
+        P = link_positions_w - center_of_mass_world.unsqueeze(1)  # [num_envs, num_links, 3]
 
         # Step 3: Compute SVD for each environment
-        # We need to handle each environment separately for SVD
-        self.virtual_chasis_rot_mat = torch.zeros((self.num_envs, 3, 3), device=self.device, dtype=torch.float32)
+        self.virtual_chassis_rot_mat = torch.zeros((self.num_envs, 3, 3), device=self.device, dtype=torch.float32)
 
-        # for env_idx in range(num_envs):
-        #     # Get position matrix for this environment
-        #     P_env = P[env_idx]  # [num_links, 3]
+        for env_idx in range(self.num_envs):
+            # Get position matrix for this environment
+            P_env = P[env_idx]  # [num_links, 3]
 
-        #     # Compute SVD: P = U * S * V^T
-        #     # V contains the eigenvectors of P^T * P (principal axes)
-        #     try:
-        #         U, S, Vt = torch.linalg.svd(P_env, full_matrices=False)
-        #         V = Vt.T  # Convert V^T to V: [3, 3]
+            # Compute SVD: P = U * S * V^T
+            # V contains the eigenvectors of P^T * P (principal axes)
+            try:
+                U, S, Vt = torch.linalg.svd(P_env, full_matrices=False)
+                V = Vt.T  # Convert V^T to V: [3, 3]
 
-        #         # Step 4: Ensure right-handed coordinate system
-        #         # Third singular vector should be cross product of first and second
-        #         v1, v2 = V[:, 0], V[:, 1]
-        #         v3_expected = torch.linalg.cross(v1, v2)
+                # Step 4: Ensure right-handed coordinate system
+                # Third singular vector should be cross product of first and second
+                v1, v2 = V[:, 0], V[:, 1]
+                v3_expected = torch.linalg.cross(v1, v2)
 
-        #         # Ensure third column matches expected direction
-        #         if torch.dot(V[:, 2], v3_expected) < 0:
-        #             V[:, 2] = -V[:, 2]
+                # Ensure third column matches expected direction
+                if torch.dot(V[:, 2], v3_expected) < 0:
+                    V[:, 2] = -V[:, 2]
 
-        #         # Step 5: Handle sign consistency with previous timestep
-        #         if prev_rotation_matrix is not None:
-        #             prev_V = prev_rotation_matrix[env_idx].to(self.device)
+                # Step 5: Handle sign consistency with previous timestep
+                if hasattr(self, "prev_virtual_chassis_rot_mat") and self.prev_virtual_chassis_rot_mat is not None:
+                    prev_V = self.prev_virtual_chassis_rot_mat[env_idx].to(self.device)
 
-        #             # Enforce positive dot products with previous frame to prevent flips
-        #             for i in range(2):  # Only check first two vectors
-        #                 if torch.dot(V[:, i], prev_V[:, i]) < 0:
-        #                     V[:, i] = -V[:, i]
+                    # Only apply sign consistency if previous matrix is not zeros (i.e., after first computation)
+                    if not torch.allclose(prev_V, torch.zeros_like(prev_V)):
+                        # Enforce positive dot products with previous frame to prevent flips
+                        for i in range(2):  # Only check first two vectors
+                            if torch.dot(V[:, i], prev_V[:, i]) < 0:
+                                V[:, i] = -V[:, i]
 
-        #             # Recompute third vector to maintain right-handed system
-        #             V[:, 2] = torch.linalg.cross(V[:, 0], V[:, 1])
+                        # Recompute third vector to maintain right-handed system
+                        V[:, 2] = torch.linalg.cross(V[:, 0], V[:, 1])
 
-        #         rotation_matrices[env_idx] = V
+                self.virtual_chassis_rot_mat[env_idx] = V
 
-        #     except Exception as e:
-        #         # Fallback to identity matrix if SVD fails
-        #         print(f"Warning: SVD failed for environment {env_idx}, using identity matrix: {e}")
-        #         rotation_matrices[env_idx] = torch.eye(3, device=self.device, dtype=torch.float32)
+            except Exception as e:
+                # Fallback to identity matrix if SVD fails
+                print(f"Warning: SVD failed for environment {env_idx}, using identity matrix: {e}")
+                self.virtual_chassis_rot_mat[env_idx] = torch.eye(3, device=self.device, dtype=torch.float32)
+
+        # Store current rotation matrix for next timestep
+        self.prev_virtual_chassis_rot_mat = self.virtual_chassis_rot_mat.clone()
 
         # Update the virtual chassis frame marker if enabled
         self._update_virtual_chassis_frame_visualization()
