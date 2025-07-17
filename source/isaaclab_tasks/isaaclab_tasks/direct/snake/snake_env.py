@@ -96,11 +96,14 @@ class SnakeEnv(DirectRLEnv):
             single_obs_size = self._get_single_observation_size()
             self.obs_history = torch.zeros((self.num_envs, self.history_length, single_obs_size), device=self.device)
 
-        # Initialize frame visualization for virtual chassis
-        self._setup_virtual_chassis_frame_markers()
+        if self.cfg.enable_virtual_chassis:
+            # Initialize frame visualization for virtual chassis
+            self._setup_virtual_chassis_frame_markers()
 
-        # Initialize previous rotation matrix for virtual chassis sign consistency
-        self.prev_virtual_chassis_rot_mat = torch.zeros((self.num_envs, 3, 3), device=self.device, dtype=torch.float32)
+            # Initialize previous rotation matrix for virtual chassis sign consistency
+            self.prev_virtual_chassis_rot_mat = torch.zeros(
+                (self.num_envs, 3, 3), device=self.device, dtype=torch.float32
+            )
 
         # Cache common data tensors (optional)
         self.joint_pos = self.snake_robot.data.joint_pos
@@ -294,9 +297,6 @@ class SnakeEnv(DirectRLEnv):
         return single_obs.shape[-1]
 
     def _get_observations(self) -> dict:
-        # Updates the virtual chassis com and rotation matrix
-        self._compute_virtual_chassis()
-
         # Get joint positions and velocities
         joint_pos = self.snake_robot.data.joint_pos
         joint_vel = self.snake_robot.data.joint_vel
@@ -308,14 +308,19 @@ class SnakeEnv(DirectRLEnv):
         velocity_limit = torch.tensor(self.cfg.robot.actuators["snake_joints"].velocity_limit, device=self.device)
         joint_vel_normalized = joint_vel / velocity_limit  # This will be in [-1, 1] when velocity is at limits
 
-        # Get end-effector position in world frame
-        link_positions_w = self.snake_robot.data.body_pos_w  # Shape: [num_envs, num_links, 3]
-        last_link_idx = link_positions_w.shape[1] - 1
-        end_effector_pos = link_positions_w[:, last_link_idx]  # Shape: [num_envs, 3]
-
         # Calculate target position relative to the end effector
         target_pos_world = self.scene.env_origins + self.target_position.unsqueeze(0)
-        target_pos_relative = target_pos_world - end_effector_pos
+
+        if self.cfg.enable_virtual_chassis:
+            # Updates the virtual chassis com and rotation matrix
+            self._compute_virtual_chassis()
+            target_pos_relative = target_pos_world - self.virtual_chassis_com_world
+        else:
+            # Get end-effector position in world frame
+            link_positions_w = self.snake_robot.data.body_pos_w  # Shape: [num_envs, num_links, 3]
+            last_link_idx = link_positions_w.shape[1] - 1
+            end_effector_pos = link_positions_w[:, last_link_idx]  # Shape: [num_envs, 3]
+            target_pos_relative = target_pos_world - end_effector_pos
 
         # Combine observations without root state information
         current_obs = torch.cat(
@@ -361,10 +366,13 @@ class SnakeEnv(DirectRLEnv):
         joint_vel = self.snake_robot.data.joint_vel
         root_pos_w = self.snake_robot.data.root_pos_w  # Need root position to calculate target in world frame
 
-        # Get end-effector (last link) position
-        link_positions_w = self.snake_robot.data.body_pos_w  # Shape: [num_envs, num_links, 3]
-        last_link_idx = link_positions_w.shape[1] - 1
-        end_effector_pos = link_positions_w[:, last_link_idx]  # Shape: [num_envs, 3]
+        if self.cfg.enable_virtual_chassis:
+            tracking_frame_pos = self.virtual_chassis_com_world
+        else:
+            # Get end-effector (last link) position
+            link_positions_w = self.snake_robot.data.body_pos_w  # Shape: [num_envs, num_links, 3]
+            last_link_idx = link_positions_w.shape[1] - 1
+            tracking_frame_pos = link_positions_w[:, last_link_idx]  # Shape: [num_envs, 3]
 
         # --- State Costs (x^T Q x) ---
 
@@ -377,12 +385,10 @@ class SnakeEnv(DirectRLEnv):
         # 3. End-effector position cost (deviation from target)
         # Calculate target position in world frame for each environment (relative to root)
         target_pos_w = root_pos_w + self.target_position.unsqueeze(0)  # [num_envs, 3]
-        end_effector_cost = self.cfg.lqr_reward.end_effector_cost * torch.sum(
-            (end_effector_pos - target_pos_w) ** 2, dim=1
-        )
+        target_cost = self.cfg.lqr_reward.target_cost * torch.sum((tracking_frame_pos - target_pos_w) ** 2, dim=1)
 
         # Total state cost
-        state_cost = joint_pos_cost + joint_vel_cost + end_effector_cost
+        state_cost = joint_pos_cost + joint_vel_cost + target_cost
 
         # --- Control Costs (u^T R u) ---
         # Use the commanded joint velocities as control inputs
@@ -391,7 +397,7 @@ class SnakeEnv(DirectRLEnv):
         # --- Additional Reward Terms ---
 
         # Check if target reached (within threshold)
-        distance_to_target = torch.norm(end_effector_pos - target_pos_w, dim=1)
+        distance_to_target = torch.norm(tracking_frame_pos - target_pos_w, dim=1)
         threshold = self.cfg.target_position.success_distance_threshold
         newly_reached = (distance_to_target < threshold) & (~self.target_reached)
         self.target_reached = self.target_reached | newly_reached
@@ -414,7 +420,7 @@ class SnakeEnv(DirectRLEnv):
         self.extras["log"].update({
             "Rewards/joint_pos_cost": joint_pos_cost.mean().item(),
             "Rewards/joint_vel_cost": joint_vel_cost.mean().item(),
-            "Rewards/end_effector_cost": end_effector_cost.mean().item(),
+            "Rewards/end_effector_cost": target_cost.mean().item(),
             "Rewards/state_cost": state_cost.mean().item(),
             "Rewards/control_cost": control_cost.mean().item(),
             "Rewards/success_bonus": success_bonus.mean().item(),
@@ -506,6 +512,10 @@ class SnakeEnv(DirectRLEnv):
         self.snake_robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self.snake_robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
 
+        # Update the virtual chassis frame
+        if self.cfg.enable_virtual_chassis:
+            self._compute_virtual_chassis()
+
         # Reset action buffer
         if env_ids is not None:
             self.joint_vel_targets[env_ids] = joint_vel
@@ -522,14 +532,17 @@ class SnakeEnv(DirectRLEnv):
             velocity_limit = torch.tensor(self.cfg.robot.actuators["snake_joints"].velocity_limit, device=self.device)
             joint_vel_normalized = joint_vel / velocity_limit
 
-            # Get end-effector position in world frame
-            link_positions_w = self.snake_robot.data.body_pos_w[env_ids]  # Shape: [num_reset_envs, num_links, 3]
-            last_link_idx = link_positions_w.shape[1] - 1
-            end_effector_pos = link_positions_w[:, last_link_idx]  # Shape: [num_reset_envs, 3]
-
             # Calculate target position relative to the end effector
             target_pos_world = self.scene.env_origins[env_ids] + self.target_position.unsqueeze(0)
-            target_pos_relative = target_pos_world - end_effector_pos
+
+            if self.cfg.enable_virtual_chassis:
+                target_pos_relative = target_pos_world - self.virtual_chassis_com_world[env_ids]
+            else:
+                # Get end-effector position in world frame
+                link_positions_w = self.snake_robot.data.body_pos_w[env_ids]  # Shape: [num_reset_envs, num_links, 3]
+                last_link_idx = link_positions_w.shape[1] - 1
+                end_effector_pos = link_positions_w[:, last_link_idx]  # Shape: [num_reset_envs, 3]
+                target_pos_relative = target_pos_world - end_effector_pos
 
             # Create the initial observation with target position included
             initial_obs = torch.cat(

@@ -22,14 +22,16 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     """Configuration for the snake robot environment."""
 
     # Base configuration for snake robot
-    fixed_base = True
+    fixed_base = False
 
     # Set to True to override RL actions with oscillation controller for floating snake robot
-    enable_oscillation_controller: bool = True
+    enable_oscillation_controller: bool = False
 
     # Disable the controller if using fixed base
     if fixed_base:
         enable_oscillation_controller = False
+
+    enable_virtual_chassis: bool = True
 
     # Length of each episode in seconds
     episode_length_s = 50.0
@@ -58,7 +60,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
         """Configuration for target position task."""
 
         # Target position relative to the root
-        target_pos: tuple = (-1.2, 0.0, 0.8)  # in meters (-1.8, 0, 0) in local frame
+        target_pos: tuple = (0.5, 0.5, 0.05)  # in meters (-1.8, 0, 0) in local frame
         # Which link to track for reaching the target (0 is root, higher numbers for other links)
         tracked_link_idx: int = 9  # Default to the 9th link (adjust based on model)
         # Scale for distance threshold (when to consider target reached)
@@ -80,7 +82,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
         # State cost matrix diagonal elements (Q matrix)
         joint_pos_cost: float = 0.01  # Cost on joint position deviation
         joint_vel_cost: float = 0.01  # Cost on joint velocity
-        end_effector_cost: float = 5.0  # Cost on end-effector position deviation from target
+        target_cost: float = 5.0  # Cost on end-effector position deviation from target
 
         # Control cost matrix diagonal elements (R matrix)
         control_cost: float = 0.01  # Cost on control inputs (joint velocities)
