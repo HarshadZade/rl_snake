@@ -10,211 +10,15 @@ import torch
 from collections.abc import Sequence
 
 import isaaclab.sim as sim_utils
-from isaaclab.actuators.actuator_cfg import ImplicitActuatorCfg
-from isaaclab.assets import Articulation, ArticulationCfg
-from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
+from isaaclab.assets import Articulation
+from isaaclab.envs import DirectRLEnv
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
-from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sim import SimulationCfg
-from isaaclab.terrains import TerrainImporter, TerrainImporterCfg
-from isaaclab.utils import configclass
+from isaaclab.terrains import TerrainImporter
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+from isaaclab.utils.math import quat_from_matrix
 
-
-@configclass
-class SnakeEnvCfg(DirectRLEnvCfg):
-    """Configuration for the snake robot environment."""
-
-    # Length of each episode in seconds
-    episode_length_s = 50.0
-
-    # Action scale determines how much the target velocity changes per RL step
-    action_scale = 0.26  # rad/s
-    action_space = 9  # 9 joints
-    observation_space = 21  # Updated: 9 (joints) + 9 (vels) + 3 (target relative position)
-    state_space = 0
-
-    # TODO: Get this from the USD instead of hardcoding # Length of each link in meters,
-    # used for height termination
-    link_length = 4.0
-
-    # Simulation configuration
-    # Number of physics steps per rendering step
-    decimation = 2
-    sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation)
-
-    # scene
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=4.0, replicate_physics=True)
-
-    # -- Target Position Configuration --
-    @configclass
-    class TargetPositionCfg:
-        """Configuration for target position task."""
-
-        # Target position relative to the root
-        target_pos: tuple = (-1.2, 0.0, 0.8)  # in meters (-1.8, 0, 0) in local frame
-        # Which link to track for reaching the target (0 is root, higher numbers for other links)
-        tracked_link_idx: int = 9  # Default to the 9th link (adjust based on model)
-        # Scale for distance threshold (when to consider target reached)
-        success_distance_threshold: float = 0.1  # in meters
-        # Visual marker configuration
-        marker_radius: float = 0.1  # Radius of the target sphere in meters
-        marker_color: tuple = (1.0, 0.0, 0.0)  # RGB color (red)
-        # Whether to show the target marker
-        show_marker: bool = True  # Set to False to hide the target marker
-
-    target_position: TargetPositionCfg = TargetPositionCfg()
-    # -- End Target Position Configuration --
-
-    # -- LQR Style Reward Parameters --
-    @configclass
-    class LQRRewardCfg:
-        """Configuration for LQR-style reward function for fixed-base snake robot."""
-
-        # State cost matrix diagonal elements (Q matrix)
-        joint_pos_cost: float = 0.01  # Cost on joint position deviation
-        joint_vel_cost: float = 0.01  # Cost on joint velocity
-        end_effector_cost: float = 5.0  # Cost on end-effector position deviation from target
-
-        # Control cost matrix diagonal elements (R matrix)
-        control_cost: float = 0.01  # Cost on control inputs (joint velocities)
-
-        # Additional reward terms
-        alive_bonus: float = 0.1  # Small bonus for staying alive
-        success_bonus: float = 100.0  # Bonus for reaching target
-
-    lqr_reward: LQRRewardCfg = LQRRewardCfg()
-
-    # -- Robot Configuration (Loading from USD)
-    robot: ArticulationCfg = ArticulationCfg(
-        prim_path="/World/envs/env_.*/Robot",  # Standard prim path pattern
-        spawn=sim_utils.UsdFileCfg(
-            usd_path=(
-                "./source/isaaclab_tasks/isaaclab_tasks/direct/snake/usd_files/snake_realistic_floating_dim_v0.usda"
-            ),
-            activate_contact_sensors=False,  # Set to True if you need contact sensors #TODO: check this
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                disable_gravity=False,
-                max_depenetration_velocity=5.0,  # Tune if needed
-            ),
-            articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-                enabled_self_collisions=True,
-                solver_position_iteration_count=8,
-                solver_velocity_iteration_count=0,
-            ),
-        ),
-        init_state=ArticulationCfg.InitialStateCfg(
-            # Define initial joint positions
-            joint_pos={
-                "joint_1": 0.0,
-            },
-            pos=(0.0, 0.0, 0.0375),  # Initial base position (adjust height based on robot) 0.15, 0.075, 0.075 m
-            rot=(0.0, 0.0, 0.0, 1.0),  # Initial base orientation
-        ),
-        actuators={
-            # Define actuators for your joints #TODO: tune all these parameters
-            "snake_joints": ImplicitActuatorCfg(
-                # Use regex matching your joint names, or list them
-                joint_names_expr=["joint_[1-9]"],  # Example regex
-                effort_limit=50.0,  # (Nm) <<< Tune
-                velocity_limit=0.262,  # (15deg/s)(rad/s) <<< Tune
-                stiffness=0.0,  # Kp
-                damping=100.0,  # Kd
-                # Tau = kp * (x - x0) + kd * (v - v0)
-            ),
-            # Add more actuator groups if joints have different properties
-        },
-    )
-
-    # ground = GroundPlaneCfg(prim_path="/World/ground")
-    # ground plane
-    terrain = TerrainImporterCfg(
-        prim_path="/World/ground",
-        terrain_type="plane",
-        collision_group=-1,
-        physics_material=sim_utils.RigidBodyMaterialCfg(
-            friction_combine_mode="average",
-            restitution_combine_mode="average",
-            static_friction=0.9,
-            dynamic_friction=0.6,
-            restitution=0.0,
-        ),
-        debug_vis=False,
-    )
-
-    # # reset
-    # joint_angle_range = [-1.57, 1.57] # rad
-
-    # -- Testing Configuration --
-    @configclass
-    class TestingCfg:
-        """Configuration for testing modes."""
-
-        # Set to True to override RL actions with manual oscillation
-        enable_manual_oscillation: bool = False
-        # Type of manual oscillation ('sidewinding' or 'constant')
-        oscillation_type: str = "sidewinding"  # 'sidewinding' or 'constant'
-        # --- Sidewinding parameters ---
-        # Amplitude in degrees (will be converted to radians)
-        amplitude_x_deg: float = 30.0  # Amplitude for even joints
-        amplitude_y_deg: float = 30.0  # Amplitude for odd joints
-        # Angular frequency
-        omega_x: float = 5.0 * math.pi / 6.0  # Angular frequency for even joints
-        omega_y: float = 5.0 * math.pi / 6.0  # Angular frequency for odd joints
-        # Phase offset per joint
-        delta_x: float = 2.0 * math.pi / 3.0  # Phase offset per even joint
-        delta_y: float = 2.0 * math.pi / 3.0  # Phase offset per odd joint
-        # Phase difference between even and odd joints
-        phi: float = 0.0
-        # --- Constant velocity parameters ---
-        constant_velocity: float = 0.262  # rad/s, constant velocity for all joints
-
-    testing: TestingCfg = TestingCfg()
-    # --- END TESTING CONFIGURATION ---
-
-    @configclass
-    class PositionTrackingCfg:
-        """Configuration for velocity tracking analysis."""
-
-        enable: bool = True
-        env_id: int = 0  # Which environment to track
-        track_all_joints: bool = True  # Whether to track all joints or just one
-        joint_id: int = 0  # Which joint to track (if not tracking all)
-        max_points: int = 1000  # Maximum number of data points to collect
-        save_interval_s: float = 10.0  # How often to save plots (seconds)
-
-    position_tracking: PositionTrackingCfg = PositionTrackingCfg()
-
-    # --- ADD OBSERVATION HISTORY CONFIGURATION ---
-    @configclass
-    class ObservationHistoryCfg:
-        """Configuration for observation history."""
-
-        enable: bool = True
-        history_length: int = 3  # How many past observations to include (including current)
-
-    observation_history: ObservationHistoryCfg = ObservationHistoryCfg()
-    # --- END OBSERVATION HISTORY CONFIGURATION ---
-
-    # --- ADD OBSERVATION VISUALIZATION CONFIG ---
-    @configclass
-    class ObservationVisualizationCfg:
-        """Configuration for observation visualization."""
-
-        enable: bool = True
-        env_id: int = 0  # Which environment to visualize
-        max_points: int = 1000  # Maximum number of data points to collect
-        save_interval_s: float = 10.0  # How often to save plots (seconds)
-        components_to_plot: list = [
-            "joint_pos",
-            "joint_vel",
-            "root_pos",
-            "root_lin_vel",
-            "root_quat",
-            "flattened_policy_obs",
-        ]
-
-    observation_visualization: ObservationVisualizationCfg = ObservationVisualizationCfg()
-    # --- END OBSERVATION VISUALIZATION CONFIG ---
+from .oscillation_controller import OscillationController
+from .snake_env_cfg import SnakeEnvCfg
 
 
 class SnakeEnv(DirectRLEnv):
@@ -224,26 +28,29 @@ class SnakeEnv(DirectRLEnv):
         super().__init__(cfg, render_mode, **kwargs)
         self._render = render_mode is not None
 
-        self.action_scale = self.cfg.action_scale
         self.env_step_counter = 0
 
         # Define which link to track for target reaching
-        self.tracked_link_idx = torch.tensor([self.cfg.target_position.tracked_link_idx], device=self.device)
+        # self.tracked_link_idx = torch.tensor([self.cfg.target_position.tracked_link_idx], device=self.device)
 
-        # Store target position
+        # Store target position, used in:
+        # 1. Constructing observation
+        # 2. Reward function
+        # 3. Reset (TODO: optionally, can vary)
         self.target_position = torch.tensor(self.cfg.target_position.target_pos, device=self.device)
 
-        # Add a buffer to track whether each environment has reached the target
+        # Add a buffer to track whether each environment has reached the target, used in:
+        # 1. Reward function
         self.target_reached = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
 
         # Track closest distance to target for each environment (initialize with large value)
+        # Updated in:
+        # 1. Reward Function
+        # 2. Reset
         self.closest_distance = torch.ones(self.num_envs, device=self.device) * 100.0
 
-        # Print debug info about links at the first step
-        self.printed_link_debug = False
-
-        self.track_positions = self.cfg.position_tracking.enable
-        if self.track_positions:
+        # Tracking initializations
+        if self.cfg.position_tracking.enable:
             self.tracking_env_id = self.cfg.position_tracking.env_id
             self.tracking_joint_id = self.cfg.position_tracking.joint_id
             self.track_all_joints = self.cfg.position_tracking.track_all_joints
@@ -257,18 +64,25 @@ class SnakeEnv(DirectRLEnv):
                 )
 
         # Initialize joint position limits
-        self.joint_pos_limits = self.snake_robot.data.soft_joint_pos_limits
-        self.joint_pos_lower_limits = self.joint_pos_limits[..., 0].to(
+        joint_pos_limits = self.snake_robot.data.soft_joint_pos_limits
+        self.joint_pos_lower_limits = joint_pos_limits[..., 0].to(
             self.device
         )  # Ellipsis (...) means all preceding dims
-        self.joint_pos_upper_limits = self.joint_pos_limits[..., 1].to(self.device)
+        self.joint_pos_upper_limits = joint_pos_limits[..., 1].to(self.device)
 
+        # Get joint position range for normalization
         self.joint_pos_ranges = self.joint_pos_upper_limits - self.joint_pos_lower_limits + 1e-6
-        self.joint_pos_mid = (self.joint_pos_lower_limits + self.joint_pos_upper_limits) / 2
 
         # Initialize joint velocity targets and previous actions
         self.joint_vel_targets = torch.zeros((self.num_envs, self.snake_robot.num_joints), device=self.device)
         self.prev_actions = torch.zeros((self.num_envs, self.snake_robot.num_joints), device=self.device)
+
+        # Initialize oscillation controller if enabled
+        if self.cfg.enable_oscillation_controller:
+            self.oscillation_controller = OscillationController(
+                cfg=self.cfg.testing, num_joints=self.snake_robot.num_joints, device=self.device
+            )
+            print(f"[Info] Oscillation controller initialized with pattern: {self.cfg.testing.oscillation_type}")
 
         # Initialize observation history if enabled
         self.use_observation_history = self.cfg.observation_history.enable
@@ -281,6 +95,15 @@ class SnakeEnv(DirectRLEnv):
             # Get the size of a single observation using the helper method
             single_obs_size = self._get_single_observation_size()
             self.obs_history = torch.zeros((self.num_envs, self.history_length, single_obs_size), device=self.device)
+
+        if self.cfg.enable_virtual_chassis:
+            # Initialize frame visualization for virtual chassis
+            self._setup_virtual_chassis_frame_markers()
+
+            # Initialize previous rotation matrix for virtual chassis sign consistency
+            self.prev_virtual_chassis_rot_mat = torch.zeros(
+                (self.num_envs, 3, 3), device=self.device, dtype=torch.float32
+            )
 
         # Cache common data tensors (optional)
         self.joint_pos = self.snake_robot.data.joint_pos
@@ -358,80 +181,97 @@ class SnakeEnv(DirectRLEnv):
             self.marker_positions, self.marker_orientations, marker_indices=self.marker_indices
         )
 
+    def _setup_virtual_chassis_frame_markers(self):
+        """Setup frame visualization markers for the virtual chassis."""
+
+        # Configure frame markers (single frame showing X, Y, Z axes)
+        marker_cfg = VisualizationMarkersCfg(
+            prim_path="/World/Visuals/VirtualChassisAxes",
+            markers={
+                "frame": sim_utils.UsdFileCfg(
+                    usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/frame_prim.usd",
+                    scale=(0.5, 0.5, 0.5),
+                ),
+            },
+        )
+        self.virtual_chassis_axes = VisualizationMarkers(marker_cfg)
+
+        # Initialize frame marker arrays
+        # We need 1 frame marker per environment
+        self.axis_positions = torch.zeros((self.num_envs, 3), device=self.device)
+        self.axis_orientations = torch.zeros((self.num_envs, 4), device=self.device)
+        self.axis_orientations[..., 3] = 1.0  # Initialize to identity quaternion
+
+        # Create marker indices: all environments use the same "frame" marker type (index 0)
+        self.axis_indices = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._compute_virtual_chassis()
+
+    def _update_virtual_chassis_frame_visualization(self):
+        """Update frame visualization for the virtual chassis in world frame."""
+        if not hasattr(self, "virtual_chassis_axes"):
+            return
+
+        # Update frame marker positions and orientations for each environment
+        for env_idx in range(self.num_envs):
+            vc_position = self.virtual_chassis_com_world[env_idx]  # Virtual chassis center in world
+            vc_rotation = self.virtual_chassis_rot_mat[env_idx]  # Virtual chassis rotation in world
+
+            # Convert rotation matrix to quaternion for the frame marker
+            vc_quaternion = quat_from_matrix(vc_rotation)
+
+            # Update position and orientation for this environment's frame marker
+            self.axis_positions[env_idx] = vc_position
+            self.axis_orientations[env_idx] = vc_quaternion
+
+        # Update the visualization
+        self.virtual_chassis_axes.visualize(
+            translations=self.axis_positions,
+            orientations=self.axis_orientations,
+            marker_indices=self.axis_indices,
+        )
+
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self.env_step_counter += 1
 
         # Store action for smoothness calculations in reward
         self.prev_actions = self.joint_vel_targets.clone()
 
-        # Check if manual oscillation test mode is enabled
-        if self.cfg.testing.enable_manual_oscillation:
-            # Create tensor to hold velocity targets
-            num_joints = self.snake_robot.num_joints
-            velocity_targets = torch.zeros((num_joints,), device=self.device)
-
-            if self.cfg.testing.oscillation_type == "sidewinding":
-                # --- SIDEWINDING MOTION PATTERN ---
-                current_time = self.sim.current_time
-
-                # Parameters from config
-                # Convert amplitude from degrees to radians
-                amplitude_x_rad = math.radians(self.cfg.testing.amplitude_x_deg)
-                amplitude_y_rad = math.radians(self.cfg.testing.amplitude_y_deg)
-
-                # Angular frequencies
-                omega_x = self.cfg.testing.omega_x
-                omega_y = self.cfg.testing.omega_y
-
-                # Phase offsets
-                delta_x = self.cfg.testing.delta_x
-                delta_y = self.cfg.testing.delta_y
-
-                # Phase difference between patterns
-                phi = self.cfg.testing.phi
-
-                # Calculate velocity for each joint (derivative of position function)
-                for i in range(num_joints):
-                    if i % 2 == 0:  # Even joints
-                        # velocity(n,t) = Ax * wx * cos(wx*t + n*deltax)
-                        velocity_targets[i] = (
-                            amplitude_x_rad * omega_x * torch.cos(torch.tensor(omega_x * current_time + i * delta_x))
-                        )
-                    else:  # Odd joints
-                        # velocity(n,t) = Ay * wy * cos(wy*t + n*deltay + phi)
-                        velocity_targets[i] = (
-                            amplitude_y_rad
-                            * omega_y
-                            * torch.cos(torch.tensor(omega_y * current_time + i * delta_y + phi))
-                        )
-
-            elif self.cfg.testing.oscillation_type == "constant":
-                # Set all joints to the same constant velocity
-                velocity_targets.fill_(self.cfg.testing.constant_velocity)
-
-            else:
-                raise ValueError(f"Unknown oscillation type: {self.cfg.testing.oscillation_type}")
-
-            # Expand to all environments
-            self.joint_vel_targets[:] = velocity_targets.unsqueeze(0).expand(self.num_envs, -1)
-
-            # Set self.actions for potential use in reward calculations
-            self.actions = torch.zeros_like(actions)
-
+        # Choose between oscillation control or policy control
+        if self.cfg.enable_oscillation_controller:
+            self._apply_oscillation_control(actions)
         else:
-            # Process actions from the policy for VELOCITY CONTROL
-            self.actions = actions.clone().clamp_(-1.0, 1.0)
+            self._apply_policy_control(actions)
 
-            # Scale normalized actions to velocity targets
-            # Map [-1, 1] to desired velocity range using action_scale
-            velocity_targets = self.action_scale * self.actions
+    def _apply_oscillation_control(self, actions: torch.Tensor) -> None:
+        """Apply oscillation patterns for testing snake locomotion."""
+        # Generate velocity targets using the oscillation controller
+        current_time = self.sim.current_time
+        velocity_targets = self.oscillation_controller.generate_velocity_targets(current_time)
 
-            # Set joint velocity targets directly - no need to accumulate like position
-            self.joint_vel_targets[:] = velocity_targets
+        # Apply to all environments
+        self.joint_vel_targets[:] = velocity_targets.unsqueeze(0).expand(self.num_envs, -1)
+
+        # Set zero actions for reward calculations
+        self.actions = torch.zeros_like(actions)
+
+    def _apply_policy_control(self, actions: torch.Tensor) -> None:
+        """Apply velocity control based on policy actions.
+
+        Args:
+            actions: Policy actions in range [-1, 1]. Shape: [num_envs, num_joints]
+        """
+        # Process and clamp actions
+        self.actions = actions.clone().clamp_(-1.0, 1.0)
+
+        # Scale normalized actions to velocity targets
+        # Map [-1, 1] to desired velocity range using action_scale
+        velocity_targets = self.cfg.action_scale * self.actions
+
+        # Set joint velocity targets directly
+        self.joint_vel_targets[:] = velocity_targets
 
     def _apply_action(self) -> None:
         # Use velocity control instead of position control
-        # self.joint_vel_targets[:] = 0.0
         self.snake_robot.set_joint_velocity_target(self.joint_vel_targets)
 
     def _get_single_observation_size(self):
@@ -468,14 +308,19 @@ class SnakeEnv(DirectRLEnv):
         velocity_limit = torch.tensor(self.cfg.robot.actuators["snake_joints"].velocity_limit, device=self.device)
         joint_vel_normalized = joint_vel / velocity_limit  # This will be in [-1, 1] when velocity is at limits
 
-        # Get end-effector position in world frame
-        link_positions_w = self.snake_robot.data.body_pos_w  # Shape: [num_envs, num_links, 3]
-        last_link_idx = link_positions_w.shape[1] - 1
-        end_effector_pos = link_positions_w[:, last_link_idx]  # Shape: [num_envs, 3]
-
         # Calculate target position relative to the end effector
         target_pos_world = self.scene.env_origins + self.target_position.unsqueeze(0)
-        target_pos_relative = target_pos_world - end_effector_pos
+
+        if self.cfg.enable_virtual_chassis:
+            # Updates the virtual chassis com and rotation matrix
+            self._compute_virtual_chassis()
+            target_pos_relative = target_pos_world - self.virtual_chassis_com_world
+        else:
+            # Get end-effector position in world frame
+            link_positions_w = self.snake_robot.data.body_pos_w  # Shape: [num_envs, num_links, 3]
+            last_link_idx = link_positions_w.shape[1] - 1
+            end_effector_pos = link_positions_w[:, last_link_idx]  # Shape: [num_envs, 3]
+            target_pos_relative = target_pos_world - end_effector_pos
 
         # Combine observations without root state information
         current_obs = torch.cat(
@@ -521,10 +366,13 @@ class SnakeEnv(DirectRLEnv):
         joint_vel = self.snake_robot.data.joint_vel
         root_pos_w = self.snake_robot.data.root_pos_w  # Need root position to calculate target in world frame
 
-        # Get end-effector (last link) position
-        link_positions_w = self.snake_robot.data.body_pos_w  # Shape: [num_envs, num_links, 3]
-        last_link_idx = link_positions_w.shape[1] - 1
-        end_effector_pos = link_positions_w[:, last_link_idx]  # Shape: [num_envs, 3]
+        if self.cfg.enable_virtual_chassis:
+            tracking_frame_pos = self.virtual_chassis_com_world
+        else:
+            # Get end-effector (last link) position
+            link_positions_w = self.snake_robot.data.body_pos_w  # Shape: [num_envs, num_links, 3]
+            last_link_idx = link_positions_w.shape[1] - 1
+            tracking_frame_pos = link_positions_w[:, last_link_idx]  # Shape: [num_envs, 3]
 
         # --- State Costs (x^T Q x) ---
 
@@ -537,12 +385,10 @@ class SnakeEnv(DirectRLEnv):
         # 3. End-effector position cost (deviation from target)
         # Calculate target position in world frame for each environment (relative to root)
         target_pos_w = root_pos_w + self.target_position.unsqueeze(0)  # [num_envs, 3]
-        end_effector_cost = self.cfg.lqr_reward.end_effector_cost * torch.sum(
-            (end_effector_pos - target_pos_w) ** 2, dim=1
-        )
+        target_cost = self.cfg.lqr_reward.target_cost * torch.sum((tracking_frame_pos - target_pos_w) ** 2, dim=1)
 
         # Total state cost
-        state_cost = joint_pos_cost + joint_vel_cost + end_effector_cost
+        state_cost = joint_pos_cost + joint_vel_cost + target_cost
 
         # --- Control Costs (u^T R u) ---
         # Use the commanded joint velocities as control inputs
@@ -551,13 +397,10 @@ class SnakeEnv(DirectRLEnv):
         # --- Additional Reward Terms ---
 
         # Check if target reached (within threshold)
-        distance_to_target = torch.norm(end_effector_pos - target_pos_w, dim=1)
+        distance_to_target = torch.norm(tracking_frame_pos - target_pos_w, dim=1)
         threshold = self.cfg.target_position.success_distance_threshold
         newly_reached = (distance_to_target < threshold) & (~self.target_reached)
         self.target_reached = self.target_reached | newly_reached
-
-        # Update closest distance tracker
-        self.closest_distance = torch.minimum(self.closest_distance, distance_to_target)
 
         # Success bonus for reaching target
         success_bonus = torch.zeros_like(distance_to_target)
@@ -571,10 +414,13 @@ class SnakeEnv(DirectRLEnv):
         total_reward = -(state_cost + control_cost) + success_bonus + alive_bonus
 
         # Update logs
+        # Update closest distance tracker
+        self.closest_distance = torch.minimum(self.closest_distance, distance_to_target)
+
         self.extras["log"].update({
             "Rewards/joint_pos_cost": joint_pos_cost.mean().item(),
             "Rewards/joint_vel_cost": joint_vel_cost.mean().item(),
-            "Rewards/end_effector_cost": end_effector_cost.mean().item(),
+            "Rewards/end_effector_cost": target_cost.mean().item(),
             "Rewards/state_cost": state_cost.mean().item(),
             "Rewards/control_cost": control_cost.mean().item(),
             "Rewards/success_bonus": success_bonus.mean().item(),
@@ -666,6 +512,10 @@ class SnakeEnv(DirectRLEnv):
         self.snake_robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self.snake_robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
 
+        # Update the virtual chassis frame
+        if self.cfg.enable_virtual_chassis:
+            self._compute_virtual_chassis()
+
         # Reset action buffer
         if env_ids is not None:
             self.joint_vel_targets[env_ids] = joint_vel
@@ -682,14 +532,17 @@ class SnakeEnv(DirectRLEnv):
             velocity_limit = torch.tensor(self.cfg.robot.actuators["snake_joints"].velocity_limit, device=self.device)
             joint_vel_normalized = joint_vel / velocity_limit
 
-            # Get end-effector position in world frame
-            link_positions_w = self.snake_robot.data.body_pos_w[env_ids]  # Shape: [num_reset_envs, num_links, 3]
-            last_link_idx = link_positions_w.shape[1] - 1
-            end_effector_pos = link_positions_w[:, last_link_idx]  # Shape: [num_reset_envs, 3]
-
             # Calculate target position relative to the end effector
             target_pos_world = self.scene.env_origins[env_ids] + self.target_position.unsqueeze(0)
-            target_pos_relative = target_pos_world - end_effector_pos
+
+            if self.cfg.enable_virtual_chassis:
+                target_pos_relative = target_pos_world - self.virtual_chassis_com_world[env_ids]
+            else:
+                # Get end-effector position in world frame
+                link_positions_w = self.snake_robot.data.body_pos_w[env_ids]  # Shape: [num_reset_envs, num_links, 3]
+                last_link_idx = link_positions_w.shape[1] - 1
+                end_effector_pos = link_positions_w[:, last_link_idx]  # Shape: [num_reset_envs, 3]
+                target_pos_relative = target_pos_world - end_effector_pos
 
             # Create the initial observation with target position included
             initial_obs = torch.cat(
@@ -707,49 +560,62 @@ class SnakeEnv(DirectRLEnv):
                     self.obs_history[env_ids, t, :] = initial_obs
 
     def _update_logs(self, obs_dict: dict) -> None:
-        """Update logs with tracking and observation data."""
+        """Updates and logs various metrics for debugging and analysis."""
+        self._log_tracking_data()
+        self._log_last_link_data()
+        self._log_mass_information()
+        self._log_torque_data()
+        self._log_observation_data(obs_dict)
+
+    def _log_tracking_data(self) -> None:
+        """Logs joint position tracking data when enabled."""
+        if not self.cfg.position_tracking.enable:
+            return
+
         # Initialize log dict if not present
         if "log" not in self.extras:
             self.extras["log"] = {}
 
-        # Log tracking data if enabled
-        if self.cfg.position_tracking.enable:
-            env_id = self.cfg.position_tracking.env_id
-            if self.track_all_joints:
-                # Initialize sum for average calculation
-                total_abs_error = 0.0
+        env_id = self.cfg.position_tracking.env_id
+        if self.track_all_joints:
+            # Initialize sum for average calculation
+            total_abs_error = 0.0
 
-                # Log commanded and actual velocities for each joint
-                for joint_idx in range(self.snake_robot.num_joints):
-                    commanded_vel = self.joint_vel_targets[env_id, joint_idx]
-                    actual_vel = self.snake_robot.data.joint_vel[env_id, joint_idx]
+            # Log commanded and actual velocities for each joint
+            for joint_idx in range(self.snake_robot.num_joints):
+                commanded_vel = self.joint_vel_targets[env_id, joint_idx]
+                actual_vel = self.snake_robot.data.joint_vel[env_id, joint_idx]
 
-                    self.extras["log"].update({
-                        f"Tracking/Joint{joint_idx}/CommandedVelocity": commanded_vel.item(),
-                        f"Tracking/Joint{joint_idx}/ActualVelocity": actual_vel.item(),
-                    })
-                    # Calculate and log error metrics
-                    error = commanded_vel - actual_vel
-                    abs_error = abs(error.item())
-                    total_abs_error += abs_error
+                self.extras["log"].update({
+                    f"Tracking/Joint{joint_idx}/CommandedVelocity": commanded_vel.item(),
+                    f"Tracking/Joint{joint_idx}/ActualVelocity": actual_vel.item(),
+                })
+                # Calculate and log error metrics
+                error = commanded_vel - actual_vel
+                abs_error = abs(error.item())
+                total_abs_error += abs_error
 
-                    self.extras["log"].update({
-                        f"Tracking/Joint{joint_idx}/Error": error.item(),
-                        f"Tracking/Joint{joint_idx}/AbsError": abs_error,
-                    })
+                self.extras["log"].update({
+                    f"Tracking/Joint{joint_idx}/Error": error.item(),
+                    f"Tracking/Joint{joint_idx}/AbsError": abs_error,
+                })
 
-                # Calculate and log average absolute error across all joints
-                avg_abs_error = total_abs_error / self.snake_robot.num_joints
-                self.extras["log"]["Tracking/AverageAbsoluteError"] = avg_abs_error
+            # Calculate and log average absolute error across all joints
+            avg_abs_error = total_abs_error / self.snake_robot.num_joints
+            self.extras["log"]["Tracking/AverageAbsoluteError"] = avg_abs_error
 
-        # Track last link position
+    def _log_last_link_data(self) -> None:
+        """Logs position data for the last link of the snake."""
+        # Initialize log dict if not present
+        if "log" not in self.extras:
+            self.extras["log"] = {}
+
         # Get all link positions in world frame
         link_positions_w = self.snake_robot.data.body_pos_w  # Shape: [num_envs, num_links, 3]
         last_link_idx = link_positions_w.shape[1] - 1  # Get the index of the last link
 
         # Get position of last link for the visualization environment
         env_id = self.cfg.observation_visualization.env_id if self.cfg.observation_visualization.enable else 0
-        # env_id = 3012
         last_link_pos_world = link_positions_w[env_id, last_link_idx]  # Shape: [3]
 
         # Get root position in world frame
@@ -784,7 +650,12 @@ class SnakeEnv(DirectRLEnv):
         self.extras["log"]["LastLink/Relative/DistanceFromBase"] = relative_distance
         self.extras["log"]["LastLink/Relative/PlanarDistance"] = relative_planar_distance
 
-        # Log mass information
+    def _log_mass_information(self) -> None:
+        """Logs mass information for individual links and total mass."""
+        # Initialize log dict if not present
+        if "log" not in self.extras:
+            self.extras["log"] = {}
+
         # Get masses for all links
         link_masses = self.snake_robot.data.default_mass  # Shape: [num_envs, num_bodies]
         total_mass = torch.sum(link_masses, dim=1)  # Shape: [num_envs]
@@ -799,62 +670,172 @@ class SnakeEnv(DirectRLEnv):
         # Log total mass
         self.extras["log"]["Masses/TotalRobotMass"] = total_mass[env_id].item()
 
-        # Log actuator torques
+    def _log_torque_data(self) -> None:
+        """Logs computed and applied torque data for joints."""
+        # Initialize log dict if not present
+        if "log" not in self.extras:
+            self.extras["log"] = {}
+
+        # Get torque data
         joint_torques_computed = self.snake_robot.data.computed_torque  # Shape: [num_envs, num_joints]
         joint_torques_applied = self.snake_robot.data.applied_torque  # Shape: [num_envs, num_joints]
+
+        # Get environment ID for logging
+        env_id = self.cfg.observation_visualization.env_id if self.cfg.observation_visualization.enable else 0
 
         # Log torques for each joint
         for joint_idx in range(self.snake_robot.num_joints):
             self.extras["log"][f"Torques/Joint{joint_idx}/computed"] = joint_torques_computed[env_id, joint_idx].item()
             self.extras["log"][f"Torques/Joint{joint_idx}/applied"] = joint_torques_applied[env_id, joint_idx].item()
 
-        # Log observation data if enabled
-        if self.cfg.observation_visualization.enable:
-            env_id = self.cfg.observation_visualization.env_id
+    def _log_observation_data(self, obs_dict: dict) -> None:
+        """Logs observation data for visualization when enabled."""
+        if not self.cfg.observation_visualization.enable:
+            return
 
-            # Log joint positions and velocities
-            if "joint_pos" in self.cfg.observation_visualization.components_to_plot:
-                for joint_idx in range(self.snake_robot.num_joints):
-                    self.extras["log"][f"Observations/Joint{joint_idx}/Position"] = self.snake_robot.data.joint_pos[
-                        env_id, joint_idx
-                    ].item()
+        # Initialize log dict if not present
+        if "log" not in self.extras:
+            self.extras["log"] = {}
 
-            if "joint_vel" in self.cfg.observation_visualization.components_to_plot:
-                for joint_idx in range(self.snake_robot.num_joints):
-                    self.extras["log"][f"Observations/Joint{joint_idx}/Velocity"] = self.snake_robot.data.joint_vel[
-                        env_id, joint_idx
-                    ].item()
+        env_id = self.cfg.observation_visualization.env_id
 
-            # Log root position (world and local frame)
-            if "root_pos" in self.cfg.observation_visualization.components_to_plot:
-                for i, axis in enumerate(["X", "Y", "Z"]):
-                    self.extras["log"].update({
-                        f"Observations/Root/WorldPosition{axis}": self.snake_robot.data.root_pos_w[env_id, i].item(),
-                        f"Observations/Root/LocalPosition{axis}": self.snake_robot.data.root_link_pos_w[
-                            env_id, i
-                        ].item(),
-                    })
+        # Log joint positions and velocities
+        if "joint_pos" in self.cfg.observation_visualization.components_to_plot:
+            for joint_idx in range(self.snake_robot.num_joints):
+                self.extras["log"][f"Observations/Joint{joint_idx}/Position"] = self.snake_robot.data.joint_pos[
+                    env_id, joint_idx
+                ].item()
 
-            # Log root linear velocity
-            if "root_lin_vel" in self.cfg.observation_visualization.components_to_plot:
-                for i, axis in enumerate(["X", "Y", "Z"]):
-                    self.extras["log"][f"Observations/Root/LinearVelocity{axis}"] = (
-                        self.snake_robot.data.root_lin_vel_w[env_id, i].item()
-                    )
+        if "joint_vel" in self.cfg.observation_visualization.components_to_plot:
+            for joint_idx in range(self.snake_robot.num_joints):
+                self.extras["log"][f"Observations/Joint{joint_idx}/Velocity"] = self.snake_robot.data.joint_vel[
+                    env_id, joint_idx
+                ].item()
 
-            # Log root orientation (quaternion)
-            if "root_quat" in self.cfg.observation_visualization.components_to_plot:
-                for i, component in enumerate(["W", "X", "Y", "Z"]):
-                    self.extras["log"][f"Observations/Root/Quaternion{component}"] = self.snake_robot.data.root_quat_w[
-                        env_id, i
-                    ].item()
+        # Log root position (world and local frame)
+        if "root_pos" in self.cfg.observation_visualization.components_to_plot:
+            for i, axis in enumerate(["X", "Y", "Z"]):
+                self.extras["log"].update({
+                    f"Observations/Root/WorldPosition{axis}": self.snake_robot.data.root_pos_w[env_id, i].item(),
+                    f"Observations/Root/LocalPosition{axis}": self.snake_robot.data.root_link_pos_w[env_id, i].item(),
+                })
 
-            # Log flattened policy observation
-            if "flattened_policy_obs" in self.cfg.observation_visualization.components_to_plot:
-                if self.use_observation_history:
-                    policy_obs = self.obs_history[env_id].reshape(-1)
-                else:
-                    policy_obs = obs_dict["policy"][env_id]
+        # Log root linear velocity
+        if "root_lin_vel" in self.cfg.observation_visualization.components_to_plot:
+            for i, axis in enumerate(["X", "Y", "Z"]):
+                self.extras["log"][f"Observations/Root/LinearVelocity{axis}"] = self.snake_robot.data.root_lin_vel_w[
+                    env_id, i
+                ].item()
 
-                for i in range(len(policy_obs)):
-                    self.extras["log"][f"Observations/PolicyObs/Dim{i}"] = policy_obs[i].item()
+        # Log root orientation (quaternion)
+        if "root_quat" in self.cfg.observation_visualization.components_to_plot:
+            for i, component in enumerate(["W", "X", "Y", "Z"]):
+                self.extras["log"][f"Observations/Root/Quaternion{component}"] = self.snake_robot.data.root_quat_w[
+                    env_id, i
+                ].item()
+
+        # Log flattened policy observation
+        if "flattened_policy_obs" in self.cfg.observation_visualization.components_to_plot:
+            if self.use_observation_history:
+                policy_obs = self.obs_history[env_id].reshape(-1)
+            else:
+                policy_obs = obs_dict["policy"][env_id]
+
+            for i in range(len(policy_obs)):
+                self.extras["log"][f"Observations/PolicyObs/Dim{i}"] = policy_obs[i].item()
+
+    def _compute_mass_weighted_com_world_frame(self) -> torch.Tensor:
+        # Get body center of mass positions in world frame and ensure correct device
+        body_com_pos_w = self.snake_robot.data.body_com_pos_w.to(self.device)  # [num_envs, num_bodies, 3]
+
+        # Get body masses and ensure correct device
+        body_masses = self.snake_robot.data.default_mass.to(self.device)  # [num_envs, num_bodies]
+
+        # Calculate mass-weighted center of mass
+        # COM = Σ(mass_i * position_i) / Σ(mass_i)
+        total_mass = torch.sum(body_masses, dim=1, keepdim=True)  # [num_envs, 1]
+
+        # Weight each body COM position by its mass
+        weighted_positions = body_com_pos_w * body_masses.unsqueeze(-1)  # [num_envs, num_bodies, 3]
+
+        # Sum weighted positions and divide by total mass
+        mass_weighted_com = torch.sum(weighted_positions, dim=1) / total_mass  # [num_envs, 3]
+
+        return mass_weighted_com
+
+    def _compute_virtual_chassis(self) -> None:
+        """
+        Compute virtual chassis pose using SVD method from Rollinson 2012.
+
+        This method implements the virtual chassis computation as described in:
+        "Virtual Chassis for Snake Robots: Definition and Applications" by Rollinson et al.
+
+        The virtual chassis is defined as a body frame whose origin is at the robot's center
+        of mass and whose axes are aligned with the robot's principal moments of inertia.
+
+        The method computes:
+        - self.virtual_chassis_com_world: [num_envs, 3] - Center of mass position in world frame
+        - self.virtual_chassis_rot_mat: [num_envs, 3, 3] - Virtual chassis rotation matrix in world frame
+
+        The rotation matrix represents the orientation of the virtual chassis frame relative to
+        the world coordinate system, where the axes are aligned with the principal directions
+        of the robot's link distribution.
+        """
+        # Step 1: Compute center of mass of all links
+        center_of_mass_world = self._compute_mass_weighted_com_world_frame()  # [num_envs, 3]
+
+        # Ensure center_of_mass is on correct device
+        self.virtual_chassis_com_world = center_of_mass_world.to(self.device)
+
+        # Step 2: Get link positions in world frame and create position matrix P relative to center of mass
+        link_positions_w = self.snake_robot.data.body_pos_w.to(self.device)  # [num_envs, num_links, 3]
+        P = link_positions_w - center_of_mass_world.unsqueeze(1)  # [num_envs, num_links, 3]
+
+        # Step 3: Compute SVD for each environment
+        self.virtual_chassis_rot_mat = torch.zeros((self.num_envs, 3, 3), device=self.device, dtype=torch.float32)
+
+        for env_idx in range(self.num_envs):
+            # Get position matrix for this environment
+            P_env = P[env_idx]  # [num_links, 3]
+
+            # Compute SVD: P = U * S * V^T
+            # V contains the eigenvectors of P^T * P (principal axes)
+            try:
+                U, S, Vt = torch.linalg.svd(P_env, full_matrices=False)
+                V = Vt.T  # Convert V^T to V: [3, 3]
+
+                # Step 4: Ensure right-handed coordinate system
+                # Third singular vector should be cross product of first and second
+                v1, v2 = V[:, 0], V[:, 1]
+                v3_expected = torch.linalg.cross(v1, v2)
+
+                # Ensure third column matches expected direction
+                if torch.dot(V[:, 2], v3_expected) < 0:
+                    V[:, 2] = -V[:, 2]
+
+                # Step 5: Handle sign consistency with previous timestep
+                if hasattr(self, "prev_virtual_chassis_rot_mat") and self.prev_virtual_chassis_rot_mat is not None:
+                    prev_V = self.prev_virtual_chassis_rot_mat[env_idx].to(self.device)
+
+                    # Only apply sign consistency if previous matrix is not zeros (i.e., after first computation)
+                    if not torch.allclose(prev_V, torch.zeros_like(prev_V)):
+                        # Enforce positive dot products with previous frame to prevent flips
+                        for i in range(2):  # Only check first two vectors
+                            if torch.dot(V[:, i], prev_V[:, i]) < 0:
+                                V[:, i] = -V[:, i]
+
+                        # Recompute third vector to maintain right-handed system
+                        V[:, 2] = torch.linalg.cross(V[:, 0], V[:, 1])
+
+                self.virtual_chassis_rot_mat[env_idx] = V
+
+            except Exception as e:
+                # Fallback to identity matrix if SVD fails
+                print(f"Warning: SVD failed for environment {env_idx}, using identity matrix: {e}")
+                self.virtual_chassis_rot_mat[env_idx] = torch.eye(3, device=self.device, dtype=torch.float32)
+
+        # Store current rotation matrix for next timestep
+        self.prev_virtual_chassis_rot_mat = self.virtual_chassis_rot_mat.clone()
+
+        # Update the virtual chassis frame marker if enabled
+        self._update_virtual_chassis_frame_visualization()
