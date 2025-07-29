@@ -26,8 +26,8 @@ class SnakeEnvCfg(DirectRLEnvCfg):
 
     # Action scale determines how much the target velocity changes per RL step
     action_scale = 0.26  # rad/s
-    action_space = 9  # 9 joints
-    observation_space = 21  # Updated: 9 (joints) + 9 (vels) + 3 (target relative position)
+    action_space = 3  # 9 joints
+    observation_space = 9  # Updated: 9 (joints) + 9 (vels) + 3 (target relative position)
     state_space = 0
 
     # TODO: Get this from the USD instead of hardcoding # Length of each link in meters,
@@ -40,7 +40,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation)
 
     # scene
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=4.0, replicate_physics=True)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=1.0, replicate_physics=True)
 
     # Set to True to override RL actions with oscillation control
     enable_oscillation_controller: bool = True
@@ -60,7 +60,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
         marker_radius: float = 0.1  # Radius of the target sphere in meters
         marker_color: tuple = (1.0, 0.0, 0.0)  # RGB color (red)
         # Whether to show the target marker
-        show_marker: bool = True  # Set to False to hide the target marker
+        show_marker: bool = False  # Set to False to hide the target marker
 
     target_position: TargetPositionCfg = TargetPositionCfg()
     # -- End Target Position Configuration --
@@ -89,7 +89,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
         prim_path="/World/envs/env_.*/Robot",  # Standard prim path pattern
         spawn=sim_utils.UsdFileCfg(
             usd_path=(
-                "./source/isaaclab_tasks/isaaclab_tasks/direct/snake/usd_files/snake_realistic_floating_dim_v0.usda"
+                "./source/isaaclab_tasks/isaaclab_tasks/direct/snake/usd_files/org_urdf.usd"
             ),
             activate_contact_sensors=False,  # Set to True if you need contact sensors #TODO: check this
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
@@ -105,20 +105,20 @@ class SnakeEnvCfg(DirectRLEnvCfg):
         init_state=ArticulationCfg.InitialStateCfg(
             # Define initial joint positions
             joint_pos={
-                "joint_1": 0.0,
+                "H1": 0.0,
             },
-            pos=(0.0, 0.0, 0.0375),  # Initial base position (adjust height based on robot) 0.15, 0.075, 0.075 m
+            pos=(0.0, 0.0, 0.01),  # Initial base position (adjust height based on robot) 0.15, 0.075, 0.075 m
             rot=(0.0, 0.0, 0.0, 1.0),  # Initial base orientation
         ),
         actuators={
             # Define actuators for your joints #TODO: tune all these parameters
             "snake_joints": ImplicitActuatorCfg(
                 # Use regex matching your joint names, or list them
-                joint_names_expr=["joint_[1-9]"],  # Example regex
+                joint_names_expr=["H[1-3]"],  # Example regex
                 effort_limit=50.0,  # (Nm) <<< Tune
                 velocity_limit=0.262,  # (15deg/s)(rad/s) <<< Tune
                 stiffness=0.0,  # Kp
-                damping=100.0,  # Kd
+                damping=10.0,  # Kd
                 # Tau = kp * (x - x0) + kd * (v - v0)
             ),
             # Add more actuator groups if joints have different properties

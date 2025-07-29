@@ -12,7 +12,7 @@ from . import agents
 ##
 
 gym.register(
-    id="Isaac-Snake-FixedBase-v0",
+    id="Isaac-Snake-Testing-urdf",
     entry_point=f"{__name__}.snake_env:SnakeEnv",
     disable_env_checker=True,
     kwargs={

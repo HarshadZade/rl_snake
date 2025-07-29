@@ -13,7 +13,7 @@ class SnakePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
     max_iterations = 1000
     save_interval = 50
-    experiment_name = "Isaac-Snake-FixedBase-v0"
+    experiment_name = "Isaac-Snake-Testing-urdf"
     empirical_normalization = False
 
     # Neural network configuration
