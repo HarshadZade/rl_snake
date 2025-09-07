@@ -119,7 +119,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
             joint_pos={
                 "joint_1": 0.0,
             },
-            pos=(0.0, 0.0, 0.0375),  # Initial base position (adjust height based on robot) 0.15, 0.075, 0.075 m
+            pos=(0.0, 0.0, 0.075),  # Initial base position (adjust height based on robot) 0.15, 0.075, 0.075 m
             rot=(0.0, 0.0, 0.0, 1.0),  # Initial base orientation
         ),
         actuators={
@@ -225,3 +225,17 @@ class SnakeEnvCfg(DirectRLEnvCfg):
 
     observation_visualization: ObservationVisualizationCfg = ObservationVisualizationCfg()
     # --- END OBSERVATION VISUALIZATION CONFIG ---
+
+    # --- PROGRESS TRACKING CONFIG ---
+    @configclass
+    class ProgressTrackingCfg:
+        """Configuration for progress tracking termination condition."""
+
+        enable: bool = True  # Whether to enable progress tracking termination
+        progress_check_window: int = 50  # Number of steps to wait before checking progress from episode start
+        min_progress_threshold: float = (
+            0.05  # Minimum distance robot should move toward goal since episode start (meters)
+        )
+
+    progress_tracking: ProgressTrackingCfg = ProgressTrackingCfg()
+    # --- END PROGRESS TRACKING CONFIG ---

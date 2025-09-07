@@ -96,6 +96,25 @@ class SnakeEnv(DirectRLEnv):
             single_obs_size = self._get_single_observation_size()
             self.obs_history = torch.zeros((self.num_envs, self.history_length, single_obs_size), device=self.device)
 
+        # Initialize progress tracking for termination condition
+        self.progress_check_window = self.cfg.progress_tracking.progress_check_window
+        self.min_progress_threshold = self.cfg.progress_tracking.min_progress_threshold
+
+        # Store initial position for each episode to track progress from start
+        self.episode_start_position = torch.zeros((self.num_envs, 3), device=self.device)
+        self.episode_step_count = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+
+        if self.cfg.progress_tracking.enable:
+            print(
+                f"[Info] Progress tracking initialized: check after {self.progress_check_window} steps,"
+                f" {self.min_progress_threshold}m threshold from episode start"
+            )
+        else:
+            print("[Info] Progress tracking termination disabled")
+
+        # Initialize cumulative termination counters for episode statistics
+        self.cumulative_terminations = {"joint_out_of_bounds": 0, "no_progress": 0, "time_out": 0, "total_episodes": 0}
+
         if self.cfg.enable_virtual_chassis:
             # Initialize frame visualization for virtual chassis
             self._setup_virtual_chassis_frame_markers()
@@ -351,6 +370,111 @@ class SnakeEnv(DirectRLEnv):
 
         return observations
 
+    def _update_episode_step_count(self) -> None:
+        """Update step count for progress tracking."""
+        self.episode_step_count += 1
+
+    def _check_progress_toward_goal(self) -> torch.Tensor:
+        """Check if robot has made sufficient progress toward goal since episode start.
+
+        Returns:
+            no_progress: Boolean tensor [num_envs] indicating environments with insufficient progress
+        """
+        # Return False for all environments if progress tracking is disabled
+        if not self.cfg.progress_tracking.enable:
+            return torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+
+        # Only check progress if we have been running for enough steps
+        sufficient_steps = self.episode_step_count >= self.progress_check_window
+
+        if not torch.any(sufficient_steps):
+            # Not enough steps yet, no termination
+            return torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+
+        # Get target position in world frame for each environment
+        target_pos_w = self.scene.env_origins + self.target_position.unsqueeze(0)  # [num_envs, 3]
+
+        # Get current control point position
+        if self.cfg.enable_virtual_chassis:
+            current_positions = self.virtual_chassis_com_world
+        else:
+            # Get end-effector (last link) position
+            link_positions_w = self.snake_robot.data.body_pos_w  # Shape: [num_envs, num_links, 3]
+            last_link_idx = link_positions_w.shape[1] - 1
+            current_positions = link_positions_w[:, last_link_idx]  # Shape: [num_envs, 3]
+
+        # Calculate distances to target at episode start and current position
+        start_distance_to_target = torch.norm(self.episode_start_position - target_pos_w, dim=1)  # [num_envs]
+        current_distance_to_target = torch.norm(current_positions - target_pos_w, dim=1)  # [num_envs]
+
+        # Progress is reduction in distance to target since episode start
+        progress_made = start_distance_to_target - current_distance_to_target  # [num_envs]
+
+        # Check if progress is less than threshold (insufficient progress)
+        insufficient_progress = progress_made < self.min_progress_threshold
+
+        # Only apply termination to environments with sufficient steps
+        no_progress = insufficient_progress & sufficient_steps
+
+        return no_progress
+
+    def _log_progress_tracking_metrics(self) -> None:
+        """Log progress tracking metrics for monitoring."""
+        # Only log if progress tracking is enabled
+        if not self.cfg.progress_tracking.enable:
+            return
+
+        # Calculate metrics for logging
+        sufficient_steps = self.episode_step_count >= self.progress_check_window
+
+        # Only calculate other metrics if some environments have sufficient steps
+        if torch.any(sufficient_steps):
+            # Get target position in world frame for each environment
+            target_pos_w = self.scene.env_origins + self.target_position.unsqueeze(0)  # [num_envs, 3]
+
+            # Get current control point position
+            if self.cfg.enable_virtual_chassis:
+                current_positions = self.virtual_chassis_com_world
+            else:
+                # Get end-effector (last link) position
+                link_positions_w = self.snake_robot.data.body_pos_w  # Shape: [num_envs, num_links, 3]
+                last_link_idx = link_positions_w.shape[1] - 1
+                current_positions = link_positions_w[:, last_link_idx]  # Shape: [num_envs, 3]
+
+            # Calculate distances to target at episode start and current position
+            start_distance_to_target = torch.norm(self.episode_start_position - target_pos_w, dim=1)  # [num_envs]
+            current_distance_to_target = torch.norm(current_positions - target_pos_w, dim=1)  # [num_envs]
+
+            # Progress is reduction in distance to target since episode start
+            progress_made = start_distance_to_target - current_distance_to_target  # [num_envs]
+
+            # Check if progress is less than threshold (insufficient progress)
+            insufficient_progress = progress_made < self.min_progress_threshold
+
+            # Log the metrics
+            if "log" not in self.extras:
+                self.extras["log"] = {}
+
+            self.extras["log"].update({
+                "ProgressTracking/mean_progress_made": progress_made.mean().item(),
+                "ProgressTracking/start_distance_to_target": start_distance_to_target.mean().item(),
+                "ProgressTracking/current_distance_to_target": current_distance_to_target.mean().item(),
+                "ProgressTracking/environments_with_sufficient_steps": torch.sum(sufficient_steps).item(),
+                "ProgressTracking/environments_with_insufficient_progress": torch.sum(insufficient_progress).item(),
+                "ProgressTracking/min_progress_threshold": self.min_progress_threshold,
+                "ProgressTracking/progress_check_window": self.progress_check_window,
+            })
+        else:
+            # No environments have sufficient steps yet, log basic info
+            if "log" not in self.extras:
+                self.extras["log"] = {}
+
+            self.extras["log"].update({
+                "ProgressTracking/environments_with_sufficient_steps": 0.0,
+                "ProgressTracking/min_progress_threshold": self.min_progress_threshold,
+                "ProgressTracking/progress_check_window": self.progress_check_window,
+            })
+
     def _get_rewards(self) -> torch.Tensor:
         """
         Calculate rewards using an LQR-style quadratic cost function for fixed-base snake robot.
@@ -417,6 +541,12 @@ class SnakeEnv(DirectRLEnv):
         # Update closest distance tracker
         self.closest_distance = torch.minimum(self.closest_distance, distance_to_target)
 
+        # Update step count for progress tracking
+        self._update_episode_step_count()
+
+        # Log progress tracking metrics before any terminations/resets
+        self._log_progress_tracking_metrics()
+
         self.extras["log"].update({
             "Rewards/joint_pos_cost": joint_pos_cost.mean().item(),
             "Rewards/joint_vel_cost": joint_vel_cost.mean().item(),
@@ -443,16 +573,35 @@ class SnakeEnv(DirectRLEnv):
             self.joint_pos > self.joint_pos_upper_limits, dim=1
         )
 
+        # Check for insufficient progress toward goal
+        no_progress = self._check_progress_toward_goal()
+
         # Combine all termination conditions
-        # terminated = out_of_bounds | vel_violation | torque_violation
-        terminated = out_of_bounds
+        terminated = out_of_bounds | no_progress
         if "log" not in self.extras:  # Initialize if not present
             self.extras["log"] = {}
 
+        # Update cumulative termination counters for episodes that are ending
+        joint_out_of_bounds_count = int(torch.sum(out_of_bounds).item())
+        no_progress_count = int(torch.sum(no_progress).item())
+        time_out_count = int(torch.sum(time_out).item())
+
+        # Add to cumulative counters
+        self.cumulative_terminations["joint_out_of_bounds"] += joint_out_of_bounds_count
+        self.cumulative_terminations["no_progress"] += no_progress_count
+        self.cumulative_terminations["time_out"] += time_out_count
+        self.cumulative_terminations["total_episodes"] += joint_out_of_bounds_count + no_progress_count + time_out_count
+
         # Add termination info to extras["log"]
         self.extras["log"].update({
-            "terminations/joint_out_of_bounds": torch.sum(out_of_bounds).item(),
-            "terminations/time_out": torch.sum(time_out).item(),
+            "terminations/joint_out_of_bounds": joint_out_of_bounds_count,
+            "terminations/no_progress": no_progress_count,
+            "terminations/time_out": time_out_count,
+            # Add cumulative statistics
+            "terminations_cumulative/joint_out_of_bounds": self.cumulative_terminations["joint_out_of_bounds"],
+            "terminations_cumulative/no_progress": self.cumulative_terminations["no_progress"],
+            "terminations_cumulative/time_out": self.cumulative_terminations["time_out"],
+            "terminations_cumulative/total_episodes": self.cumulative_terminations["total_episodes"],
         })
 
         return terminated, time_out
@@ -467,11 +616,17 @@ class SnakeEnv(DirectRLEnv):
             self.target_reached[env_ids] = False
             self.closest_distance[env_ids] = torch.ones(len(env_ids), device=self.device) * 100.0
 
+            # Reset step count for reset environments
+            self.episode_step_count[env_ids] = 0
+
             # Update marker positions for reset environments
             self._update_target_markers(env_ids)
         else:
             self.target_reached = torch.zeros_like(self.target_reached)
             self.closest_distance = torch.ones_like(self.closest_distance) * 100.0
+
+            # Reset step count for all environments
+            self.episode_step_count.fill_(0)
 
             # Update all marker positions
             self._update_target_markers()
@@ -515,6 +670,18 @@ class SnakeEnv(DirectRLEnv):
         # Update the virtual chassis frame
         if self.cfg.enable_virtual_chassis:
             self._compute_virtual_chassis()
+
+        # Store initial position for progress tracking after simulation state is written
+        if self.cfg.progress_tracking.enable:
+            if self.cfg.enable_virtual_chassis:
+                initial_tracking_pos = self.virtual_chassis_com_world[env_ids]
+            else:
+                # Get end-effector (last link) position
+                link_positions_w = self.snake_robot.data.body_pos_w[env_ids]  # Shape: [num_reset_envs, num_links, 3]
+                last_link_idx = link_positions_w.shape[1] - 1
+                initial_tracking_pos = link_positions_w[:, last_link_idx]  # Shape: [num_reset_envs, 3]
+
+            self.episode_start_position[env_ids] = initial_tracking_pos
 
         # Reset action buffer
         if env_ids is not None:
