@@ -37,14 +37,14 @@ class SnakeEnvCfg(DirectRLEnvCfg):
     episode_length_s = 50.0
 
     # Action scale determines how much the target velocity changes per RL step
-    action_scale = 2.6  # rad/s
+    action_scale = 3.0  # rad/s
     action_space = 9  # 9 joints
     observation_space = 21  # Updated: 9 (joints) + 9 (vels) + 3 (target relative position)
     state_space = 0
 
-    # TODO: Get this from the USD instead of hardcoding # Length of each link in meters,
-    # used for height termination
-    link_length = 4.0
+    # Distance between joints in meters (extracted from USD file)
+    # Each link center is 0.2m apart based on USD positioning
+    link_length = 0.2
 
     # Simulation configuration
     # Number of physics steps per rendering step
@@ -111,7 +111,7 @@ class SnakeEnvCfg(DirectRLEnvCfg):
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
                 enabled_self_collisions=True,
                 solver_position_iteration_count=8,
-                solver_velocity_iteration_count=0,
+                solver_velocity_iteration_count=2,
             ),
         ),
         init_state=ArticulationCfg.InitialStateCfg(
@@ -127,10 +127,10 @@ class SnakeEnvCfg(DirectRLEnvCfg):
             "snake_joints": ImplicitActuatorCfg(
                 # Use regex matching your joint names, or list them
                 joint_names_expr=["joint_[1-9]"],  # Example regex
-                effort_limit=50.0,  # (Nm) <<< Tune
-                velocity_limit=0.262,  # (15deg/s)(rad/s) <<< Tune
+                effort_limit_sim=50.0,  # (Nm) <<< Tune
+                velocity_limit_sim=10.0,  # (286deg/s)(rad/s) <<< Tune
                 stiffness=0.0,  # Kp
-                damping=100.0,  # Kd
+                damping=5.0,  # Kd
                 # Tau = kp * (x - x0) + kd * (v - v0)
             ),
             # Add more actuator groups if joints have different properties
@@ -144,10 +144,10 @@ class SnakeEnvCfg(DirectRLEnvCfg):
         terrain_type="plane",
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
-            friction_combine_mode="average",
-            restitution_combine_mode="average",
-            static_friction=0.9,
-            dynamic_friction=0.6,
+            friction_combine_mode="multiply",
+            restitution_combine_mode="multiply",
+            static_friction=1.2,
+            dynamic_friction=1.0,
             restitution=0.0,
         ),
         debug_vis=False,

@@ -305,7 +305,7 @@ class SnakeEnv(DirectRLEnv):
         joint_pos_normalized = 2.0 * (joint_pos - self.joint_pos_lower_limits) / self.joint_pos_ranges - 1.0
 
         # Normalize joint velocities to [-1, 1] based on velocity limits
-        velocity_limit = torch.tensor(self.cfg.robot.actuators["snake_joints"].velocity_limit, device=self.device)
+        velocity_limit = torch.tensor(self.cfg.robot.actuators["snake_joints"].velocity_limit_sim, device=self.device)
         joint_vel_normalized = joint_vel / velocity_limit  # This will be in [-1, 1] when velocity is at limits
 
         # Calculate target position relative to the end effector
@@ -529,7 +529,9 @@ class SnakeEnv(DirectRLEnv):
             )
 
             # Normalize joint velocities (which are zero at reset)
-            velocity_limit = torch.tensor(self.cfg.robot.actuators["snake_joints"].velocity_limit, device=self.device)
+            velocity_limit = torch.tensor(
+                self.cfg.robot.actuators["snake_joints"].velocity_limit_sim, device=self.device
+            )
             joint_vel_normalized = joint_vel / velocity_limit
 
             # Calculate target position relative to the end effector
